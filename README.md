@@ -89,12 +89,6 @@ python run.py train_continue
 
 # Test a pre-trained model
 python run.py test
-
-# Plot training rewards (uses the most recent training data)
-python run.py plot
-
-# Plot training rewards from a specific CSV file
-python run.py plot --file_path "data_train/20241223_133158/rewards.csv"
 ```
 
 You may need to edit the batch files to modify the model paths or other parameters.
