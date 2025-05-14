@@ -1,9 +1,9 @@
 # Multi-Agent Reinforcement Learning for Target Pursuit
 
 This project implements a Multi-Agent Twin Delayed Deep Deterministic Policy Gradient (MATD3) algorithm for a pursuit-evasion scenario with multiple hunters and targets in a 2D environment with obstacles.
-![bev](./output/trajectory_1_20250514_134509.png)
+<img src="./output/trajectory_1_20250514_134509.png" width="300" alt="bev">
 
-![test](./test_mode.png)
+<img src="./test_mode.png" width="300" alt="test">
 
 ## Environment
 
