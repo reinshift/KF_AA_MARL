@@ -152,3 +152,6 @@ python run.py plot
 # Plot a specific training result by providing the CSV file path:
 python run.py plot --file_path "data_train/20241223_133158/rewards.csv"
 ```
+
+## Notice
+Since I didn't train the targets well, as you can see in the figure, and some features (including target assignment, hunter role allocation, etc.) hasn't been implemented yet, I've marked these with #TODO comments in the code. Due to personal reasons, I currently don't have the capacity to work on these features. Contributions are Welcome, and Feel Free to submit Pull Requests – if I see a well-implemented branch, I'll merge it and list you as a contributor:)
