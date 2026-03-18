@@ -1,0 +1,167 @@
+"""
+参考速度计算器 (Reference Velocity Calculator)
+
+为target计算参考速度矢量，指导逃逸行为。
+参考速度由逃逸向量和避障向量组成，帮助target在hunter之间穿行并避开障碍物。
+"""
+
+import numpy as np
+from typing import List, Optional
+
+
+class ReferenceVelocityCalculator:
+    """
+    参考速度计算器，为target计算逃逸和避障的参考速度
+    
+    参考速度公式: v_ref = normalize(v1) + normalize(v2)
+    其中:
+        - v1: 逃逸向量，远离hunter的方向
+        - v2: 避障向量，基于激光雷达数据选择最安全的方向
+    """
+    
+    def __init__(self, perception_range: float = 0.5):
+        """
+        初始化参考速度计算器
+        
+        参数:
+            perception_range: target的感知范围，只考虑此范围内的hunter
+        """
+        self.perception_range = perception_range
+    
+    def compute_escape_vector(self, target_pos: np.ndarray,
+                             hunter_positions: List[np.ndarray]) -> np.ndarray:
+        """
+        计算逃逸向量 v1
+        
+        v1 = -Σ(x_hunter_i - x_target) / ||Σ(x_hunter_i - x_target)||
+        
+        逃逸向量指向远离所有hunter质心的方向
+        
+        参数:
+            target_pos: 目标位置 [x, y, z]
+            hunter_positions: 感知范围内的hunter位置列表
+            
+        返回:
+            逃逸向量 [vx, vy]，如果没有hunter则返回零向量
+        """
+        if len(hunter_positions) == 0:
+            return np.zeros(2)
+        
+        # 计算所有hunter到target的方向向量之和（2D）
+        direction_sum = np.zeros(2)
+        for hunter_pos in hunter_positions:
+            direction_sum += (hunter_pos[:2] - target_pos[:2])
+        
+        # 逃逸向量是反方向
+        escape_vector = -direction_sum
+        
+        return escape_vector
+    
+    def compute_avoidance_vector(self, laser_data: np.ndarray,
+                                laser_angles: np.ndarray) -> np.ndarray:
+        """
+        计算避障向量 v2，基于激光雷达数据
+        
+        选择激光距离最大的方向作为避障方向，即最安全的方向
+        
+        参数:
+            laser_data: 激光雷达距离数据，形状 (num_lasers,)
+            laser_angles: 激光雷达角度数据，形状 (num_lasers,)
+            
+        返回:
+            避障向量 [vx, vy]
+        """
+        if len(laser_data) == 0:
+            return np.zeros(2)
+        
+        # 找到距离最大的激光方向
+        max_distance_idx = np.argmax(laser_data)
+        max_angle = laser_angles[max_distance_idx]
+        
+        # 将角度转换为单位向量
+        avoidance_vector = np.array([np.cos(max_angle), np.sin(max_angle)])
+        
+        return avoidance_vector
+
+    def compute_reference_velocity(self, target, hunters: List) -> np.ndarray:
+        """
+        计算参考速度 v_ref = normalize(v1) + normalize(v2)
+        
+        处理边界情况:
+        - 如果没有hunter在感知范围内，使用随机方向或当前速度方向
+        - 如果向量为零，提供合理的默认行为
+        
+        参数:
+            target: Target对象
+            hunters: Hunter对象列表
+            
+        返回:
+            参考速度向量 [vx, vy]
+        """
+        # 找到感知范围内的hunters
+        hunters_in_range = []
+        for hunter in hunters:
+            distance = np.linalg.norm(hunter.position[:2] - target.position[:2])
+            if distance < self.perception_range:
+                hunters_in_range.append(hunter)
+        
+        # 计算逃逸向量
+        if len(hunters_in_range) > 0:
+            hunter_positions = [h.position for h in hunters_in_range]
+            v1 = self.compute_escape_vector(target.position, hunter_positions)
+        else:
+            # 没有hunter在感知范围内，使用随机方向
+            angle = np.random.uniform(0, 2 * np.pi)
+            v1 = np.array([np.cos(angle), np.sin(angle)])
+        
+        # 计算避障向量
+        v2 = self.compute_avoidance_vector(target.lasers, target.lidar.angles)
+        
+        # 处理零向量情况
+        v1_norm = np.linalg.norm(v1)
+        v2_norm = np.linalg.norm(v2)
+        
+        epsilon = 1e-6
+        
+        if v1_norm < epsilon and v2_norm < epsilon:
+            # 两个向量都为零，保持当前速度方向
+            current_vel_norm = np.linalg.norm(target.velocity[:2])
+            if current_vel_norm > epsilon:
+                return target.velocity[:2] / current_vel_norm
+            else:
+                # 默认向右
+                return np.array([1.0, 0.0])
+        elif v1_norm < epsilon:
+            # 只有v2有效
+            return v2 / v2_norm
+        elif v2_norm < epsilon:
+            # 只有v1有效
+            return v1 / v1_norm
+        else:
+            # 两个向量都有效，归一化后相加
+            v_ref = v1 / v1_norm + v2 / v2_norm
+            return v_ref
+    
+    def is_inside_obstacle(self, position: np.ndarray,
+                          obstacles: List) -> bool:
+        """
+        检测位置是否在障碍物内部
+        
+        如果位置到某个障碍物中心的距离小于障碍物半径，则认为在障碍物内部
+        
+        参数:
+            position: 位置 [x, y, z]
+            obstacles: Obstacle对象列表
+            
+        返回:
+            True如果在障碍物内部，否则False
+        """
+        for obstacle in obstacles:
+            # 计算到障碍物中心的距离（2D）
+            distance = np.linalg.norm(position[:2] - obstacle.position[:2])
+            
+            # 检查是否在障碍物半径内
+            if distance < obstacle.radius:
+                return True
+        
+        return False

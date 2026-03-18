@@ -3,6 +3,9 @@ import matplotlib.pyplot as plt
 import torch as T
 import utils
 from Lidar import Lidar
+from density_field_allocator import DensityFieldAllocator
+from reference_velocity_calculator import ReferenceVelocityCalculator
+from role_assigner import RoleAssigner
 
 '''
     class MultiTarEnv: is a world created with UAVs (multi-target&hunter) and obstacles in a limited square area.
@@ -55,14 +58,42 @@ class MultiTarEnv:
 
         # Control whether to visualize laser scans & plot relevant
         self.visualize_lasers = visualize_lasers
-        self.fig = plt.figure(figsize=(8,8))
-        self.ax = self.fig.add_subplot(111,projection='3d')
+        self.fig = None
+        self.ax = None
+        if visualize_lasers:
+            self.fig = plt.figure(figsize=(8,8))
+            self.ax = self.fig.add_subplot(111,projection='3d')
 
         # reward relevant
         self.capture_reward = 2.0        # roundup success reward
         self.chase_reward_coeff = 0.8    # chase reward coeff
         self.escape_reward_coeff = 0.4   # escape reward coeff
         self.safe_penalty_coeff = 0.7    # safe penalty coeff
+        
+        # Target reference velocity reward coefficients
+        self.alignment_reward_coeff = 0.5  # cosine similarity reward coefficient
+        self.obstacle_interior_penalty = 1.0  # penalty for being inside obstacle
+        
+        # Density field allocator for target assignment
+        self.density_allocator = DensityFieldAllocator(
+            h=0.1,      # kernel bandwidth
+            alpha=0.5,  # velocity matching weight
+            beta=0.3,   # obstacle attenuation strength
+            sigma=0.05, # obstacle influence range
+            delta=1e-6  # small constant for utility calculation
+        )
+        
+        # Reference velocity calculator for target escape strategy
+        self.ref_velocity_calculator = ReferenceVelocityCalculator(
+            perception_range=0.5  # target's perception range for hunters
+        )
+        
+        # Role assigner for hunter role assignment
+        self.role_assigner = RoleAssigner(
+            dt=self.time_step,
+            process_noise=0.01,
+            measurement_noise=0.1
+        )
     
     def _collect_obs_info(self):
         multi_obs_info = []
@@ -76,22 +107,61 @@ class MultiTarEnv:
             h_obs (list of np.array): Observations for all hunters.
             t_obs (list of np.array): Observations for all targets.
         '''
+        # Helper function to check if position is inside any obstacle
+        def is_position_valid(position, obstacles, min_clearance=0.2):
+            for obstacle in obstacles:
+                obs_x, obs_y, obs_z, obs_r, obs_h = obstacle._return_obs_info()
+                distance = np.sqrt((position[0] - obs_x)**2 + (position[1] - obs_y)**2)
+                if distance < (obs_r + min_clearance):
+                    return False
+            return True
+        
+        # Reset hunters with collision avoidance
         for hunter in self.hunters:
-            hunter.position = np.random.uniform(low=0.50, high=0.75, size=(3,))  # TODO!: initial spawn scope
-            hunter.position[-1] = 0.10  # initial height
+            max_attempts = 100
+            for attempt in range(max_attempts):
+                hunter.position = np.random.uniform(low=0.50, high=0.75, size=(3,))
+                hunter.position[-1] = 0.10  # initial height
+                if is_position_valid(hunter.position, self.obstacles):
+                    break
+                if attempt == max_attempts - 1:
+                    # Fallback: place in a safe corner
+                    hunter.position = np.array([0.1, 0.1, 0.10])
+            
             hunter.velocity = np.zeros(3)
             hunter.history_pos = []
             hunter.lasers = hunter.lidar.scan(hunter.position, self.length)
 
+        # Reset targets with collision avoidance
         for target in self.targets:
-            target.position = np.random.uniform(low=1.50, high=1.75, size=(3,))  # TODO!: initial spawn scope
-            target.position[-1] = 0.10  # initial height
+            max_attempts = 100
+            for attempt in range(max_attempts):
+                target.position = np.random.uniform(low=1.50, high=1.75, size=(3,))
+                target.position[-1] = 0.10  # initial height
+                if is_position_valid(target.position, self.obstacles):
+                    break
+                if attempt == max_attempts - 1:
+                    # Fallback: place in a safe corner
+                    target.position = np.array([1.9, 1.9, 0.10])
+            
             target.velocity = np.zeros(3)
             target.history_pos = []
             target.lasers = target.lidar.scan(target.position, self.length)
+            target.reference_velocity = np.zeros(2)  # Initialize reference velocity
+
+        # Reset role assigner (clear Kalman filters)
+        self.role_assigner.reset()
+        
+        # Initialize Kalman filters for all targets
+        for target in self.targets:
+            target_id = id(target)
+            self.role_assigner.update_kalman_filter(target_id, target.position[:2])
 
         # Assign initial targets to hunters
         self._assign_targets_to_hunters()
+        
+        # Assign initial roles to hunters
+        self._assign_hunter_roles()
 
         # Get initial observations
         h_obs, t_obs = self._get_observations()
@@ -124,13 +194,25 @@ class MultiTarEnv:
         for target in self.targets:
             target.lasers = target.lidar.scan(target.position, self.length)
 
+        # Update reference velocity for each target
+        for target in self.targets:
+            target.reference_velocity = self.ref_velocity_calculator.compute_reference_velocity(target, self.hunters)
+
         # Optionally: Boundary blocking (when train agents, 
         # to allow agents traverse the boundary may get worse performance)
         for agent in self.hunters + self.targets:
             agent.position[:2] = np.clip(agent.position[:2], 0, self.length)
 
-        # # Assign targets to hunters
-        # self._assign_targets_to_hunters()
+        # Assign targets to hunters using density field allocator
+        self._assign_targets_to_hunters()
+        
+        # Update Kalman filters for all targets
+        for target in self.targets:
+            target_id = id(target)
+            self.role_assigner.update_kalman_filter(target_id, target.position[:2])
+        
+        # Assign roles to hunters based on their assigned targets
+        self._assign_hunter_roles()
 
         # Compute rewards and check for captures
         rewards, dones = self._compute_rewards()
@@ -140,31 +222,72 @@ class MultiTarEnv:
 
         return h_obs_next, t_obs_next, rewards, dones
 
-    # TODO: introduce a density-based assignment method
     def _assign_targets_to_hunters(self):
-        num_hunters = self.num_hunters
-        num_targets = self.num_targets
-        targets = self.targets
+        """
+        使用密度场分配器为hunter分配目标
         
-        hunter_target_distances = []
+        基于密度场的目标分配机制，综合考虑：
+        - 智能体聚集效应
+        - 距离衰减
+        - 速度匹配
+        - 障碍物规避
+        """
+        # 使用密度场分配器计算最优分配
+        assignments = self.density_allocator.assign_targets(
+            self.hunters, 
+            self.targets, 
+            self.obstacles
+        )
+        
+        # 更新每个hunter的assigned_target属性
         for hunter in self.hunters:
-            distances = [np.linalg.norm(hunter.position[:2] - target.position[:2]) for target in targets]
-            hunter_target_distances.append(distances)
+            hunter_id = id(hunter)
+            if hunter_id in assignments:
+                hunter.assigned_target = assignments[hunter_id]
+            else:
+                # 如果没有分配到目标，保持之前的分配或设为None
+                hunter.assigned_target = None
+    
+    def _assign_hunter_roles(self):
+        """
+        为hunter分配角色（chaser或interceptor）
         
-        base_hunters_per_target = num_hunters // num_targets
-        extra_hunters = num_hunters % num_targets
-        hunters_per_target = [base_hunters_per_target + 1 if i < extra_hunters else base_hunters_per_target for i in range(num_targets)]
+        根据hunter与其assigned_target的相对位置、距离和速度动态分配角色。
+        同时更新hunter的target_position属性。
+        """
+        # 将hunters按照assigned_target分组
+        target_hunter_groups = {}
+        for hunter in self.hunters:
+            if hunter.assigned_target is not None:
+                target = hunter.assigned_target
+                if target not in target_hunter_groups:
+                    target_hunter_groups[target] = []
+                target_hunter_groups[target].append(hunter)
         
-        hunter_indices = list(range(num_hunters))
-
-        for target_idx in range(num_targets):
-
-            num_to_assign = hunters_per_target[target_idx]
-            sorted_hunters = sorted(hunter_indices, key=lambda x: hunter_target_distances[x][target_idx])
-            assigned_hunters = sorted_hunters[:num_to_assign]
-            for hunter_idx in assigned_hunters:
-                self.hunters[hunter_idx].assigned_target = targets[target_idx]
-                hunter_indices.remove(hunter_idx)
+        # 为每组hunters分配角色
+        for target, hunters in target_hunter_groups.items():
+            # 使用role_assigner分配角色
+            roles = self.role_assigner.assign_roles(hunters, target)
+            
+            # 更新每个hunter的role和target_position
+            for hunter in hunters:
+                hunter_id = id(hunter)
+                if hunter_id in roles:
+                    hunter.role = roles[hunter_id]
+                    # 根据角色设置target_position
+                    hunter.target_position = self.role_assigner.get_target_position_for_hunter(
+                        hunter, target, hunter.role
+                    )
+                else:
+                    # 默认为chaser
+                    hunter.role = 'chaser'
+                    hunter.target_position = target.position.copy()
+        
+        # 处理没有分配到target的hunters
+        for hunter in self.hunters:
+            if hunter.assigned_target is None:
+                hunter.role = 'chaser'
+                hunter.target_position = np.zeros(3)
 
     def _get_nearest_target(self, hunter):
         """
@@ -217,13 +340,12 @@ class MultiTarEnv:
             # Get velocity
             velocity = hunter.velocity
 
-            # Get assigned target's position and distance
-            if hunter.assigned_target is not None:
-                target_pos = hunter.assigned_target.position
-                distance_to_target = np.linalg.norm(hunter.position[:2] - target_pos[:2])
-            else:
-                target_pos = np.zeros(3)
-                distance_to_target = 0.0
+            # Get target position based on hunter's role
+            # target_position is already set by _assign_hunter_roles()
+            # For chaser: target.position
+            # For interceptor: predicted future position
+            target_pos = hunter.target_position
+            distance_to_target = np.linalg.norm(hunter.position[:2] - target_pos[:2])
 
             # Get laser data
             laser_data = hunter.lasers  # Assuming it's a 1D array of size num_lasers
@@ -257,13 +379,17 @@ class MultiTarEnv:
 
             # Get laser data
             laser_data = target.lasers  # Assuming it's a 1D array of size num_lasers
+            
+            # Get reference velocity
+            ref_vel = target.reference_velocity  # 2D reference velocity
 
             # Concatenate all observation components
             obs = np.concatenate([
                 own_pos/self.length,                    # 3
                 own_vel/self.v_max,                     # 3
                 nearest_hunters.flatten()/self.length,  # 3 * 3 = 9
-                laser_data/self.L_sensor                # num_lasers
+                laser_data/self.L_sensor,               # num_lasers
+                ref_vel/self.v_max                      # 2 (reference velocity)
             ]).astype(np.float32)
 
             t_obs.append(obs)
@@ -330,6 +456,29 @@ class MultiTarEnv:
             else:
                 escape_reward = -0.1
             rewards[self.num_hunters + target_index] += self.escape_reward_coeff * escape_reward
+            
+            # Add reference velocity alignment reward
+            # Calculate reference velocity for this target
+            v_ref = self.ref_velocity_calculator.compute_reference_velocity(target, self.hunters)
+            v_actual = target.velocity[:2]
+            
+            # Compute cosine similarity: cos(v_actual, v_ref) = (v_actual · v_ref) / (||v_actual|| * ||v_ref||)
+            v_actual_norm = np.linalg.norm(v_actual)
+            v_ref_norm = np.linalg.norm(v_ref)
+            
+            epsilon = 1e-6
+            if v_actual_norm > epsilon and v_ref_norm > epsilon:
+                cosine_similarity = np.dot(v_actual, v_ref) / (v_actual_norm * v_ref_norm)
+                alignment_reward = cosine_similarity
+            else:
+                # If either velocity is zero, no alignment reward
+                alignment_reward = 0.0
+            
+            rewards[self.num_hunters + target_index] += self.alignment_reward_coeff * alignment_reward
+            
+            # Add obstacle interior penalty
+            if self.ref_velocity_calculator.is_inside_obstacle(target.position, self.obstacles):
+                rewards[self.num_hunters + target_index] -= self.obstacle_interior_penalty
 
         # reward for safety (u-u)
         # between hunters
@@ -359,9 +508,16 @@ class MultiTarEnv:
                     rewards[self.num_hunters + j] -= penalty
 
         # reward for safety (uav-obstacles)
+        # Only penalize when very close to obstacles (< 50% of sensor range)
+        obstacle_danger_threshold = self.L_sensor * 0.5
         for agent in self.hunters + self.targets:
             min_laser_length = min(agent.lasers)
-            collision_penalty = -self.safe_penalty_coeff * (self.L_sensor - min_laser_length) / self.L_sensor
+            if min_laser_length < obstacle_danger_threshold:
+                # Scaled penalty: 0 at threshold, max at 0
+                collision_penalty = -self.safe_penalty_coeff * (obstacle_danger_threshold - min_laser_length) / obstacle_danger_threshold
+            else:
+                collision_penalty = 0.0
+            
             if agent in self.hunters:
                 agent_index = self.hunters.index(agent)
             else:
@@ -399,11 +555,16 @@ class MultiTarEnv:
         """
         Visualize the environment.
         """
+        # Lazy initialization of figure
+        if self.fig is None:
+            self.fig = plt.figure(figsize=(8,8))
+            self.ax = self.fig.add_subplot(111,projection='3d')
+        
         self.ax.clear()
         self.ax.set_xlim(0, self.length)
         self.ax.set_ylim(0, self.length)
         self.ax.set_zlim(0, self.length/4)
-        self.ax.set_title("Environment Visualization")
+        self.ax.set_title("环境可视化")
 
         # Draw boundaries
         self.ax.plot([0, self.length, self.length, 0, 0], [0, 0, self.length, self.length, 0], [0, 0, 0, 0, 0], color='black', linewidth=2)
@@ -415,7 +576,7 @@ class MultiTarEnv:
         # Draw hunters
         for hunter in self.hunters:
             x, y, z = hunter.position
-            self.ax.scatter(x, y, z, color='red', label='Hunter' if hunter == self.hunters[0] else "")
+            self.ax.scatter(x, y, z, color='red', label='追击者' if hunter == self.hunters[0] else "")
             if self.visualize_lasers:
                 # Draw lasers
                 hunter.lidar.visualize_lasers(hunter.position,self.ax)
@@ -423,13 +584,16 @@ class MultiTarEnv:
         # Draw targets
         for target in self.targets:
             x, y, z = target.position
-            self.ax.scatter(x, y, z, color='green', label='Target' if target == self.targets[0] else "")
+            self.ax.scatter(x, y, z, color='green', label='逃逸者' if target == self.targets[0] else "")
 
         self.ax.legend(loc='upper right')
         plt.pause(0.001)
 
     def close(self):
-        plt.close(self.fig)
+        if self.fig is not None:
+            plt.close(self.fig)
+            self.fig = None
+            self.ax = None
 
 
     def _create_cylinders(self, ax, x, y, z, r, h):
@@ -502,7 +666,9 @@ class AgentBase:
 class Hunter(AgentBase):
     def __init__(self, boundary_length, max_distance=0.2, num_rays=16, time_step=0.5, obstacles=None):
         super().__init__(boundary_length, max_distance, num_rays, time_step, obstacles)  # inherit base class
-        self.role = {'0':'chaser', '1':'predator'}
+        self.assigned_target = None  # Target assigned by density field allocator
+        self.role = 'chaser'  # Role: 'chaser' or 'interceptor'
+        self.target_position = np.zeros(3)  # Current target position to pursue (may be predicted position)
         '''
             # TODO: define hunter's role, chaser/predator, chaser will chase target's current position, 
                     while predator will use KF (or other way) to predict target's future position and head to it.
@@ -512,3 +678,4 @@ class Hunter(AgentBase):
 class Target(AgentBase):
     def __init__(self, boundary_length, max_distance=0.2, num_rays=16, time_step=0.5, obstacles=None):
         super().__init__(boundary_length, max_distance, num_rays, time_step, obstacles)  # inherit base class
+        self.reference_velocity = np.zeros(2)  # Reference velocity for escape strategy

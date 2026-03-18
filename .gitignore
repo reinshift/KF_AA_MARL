@@ -1,0 +1,17 @@
+.hypothesis
+.kiro
+.pytest_cache
+
+**/__pycache__
+**/*.pyc
+
+# 训练数据和模型(不开源)
+/model/
+/output/
+/data_train/
+
+# 临时文件
+*.png
+*.jpg
+*.mp4
+*.avi
