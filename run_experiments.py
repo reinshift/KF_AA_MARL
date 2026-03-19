@@ -65,7 +65,7 @@ EXPERIMENT_CONFIGS = {
     },
     'curriculum': {
         'description': 'curriculum training with staged coordination',
-        'num_episodes': 200,
+        'num_episodes': 300,
         'seed': 42,
         'save_interval': 50,
         'curriculum': {
@@ -77,7 +77,7 @@ EXPERIMENT_CONFIGS = {
                         'capture_reward': 12.0,
                         'chase_reward_coeff': 0.6,
                         'escape_reward_coeff': 0.2,
-                        'alignment_reward_coeff': 0.0,
+                        'alignment_reward_coeff': 0.2,
                         'safe_penalty_coeff': 0.8,
                         'obstacle_interior_penalty': 1.2,
                         'distance_threshold': 0.02,
@@ -113,7 +113,7 @@ EXPERIMENT_CONFIGS = {
                         'capture_reward': 10.0,
                         'chase_reward_coeff': 0.2,
                         'escape_reward_coeff': 0.6,
-                        'alignment_reward_coeff': 0.1,
+                        'alignment_reward_coeff': 0.5,
                         'safe_penalty_coeff': 0.45,
                         'obstacle_interior_penalty': 0.8,
                         'distance_threshold': 0.015,

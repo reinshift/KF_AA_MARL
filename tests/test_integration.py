@@ -234,6 +234,29 @@ class TestEscapeStrategyIntegration(unittest.TestCase):
         pos_outside = np.array([2.0, 2.0, 0.1])
         self.assertFalse(self.calculator.is_inside_obstacle(pos_outside, [obstacle]))
 
+    def test_avoidance_vector_points_away_from_shortened_rays(self):
+        """短光束对应近障碍，v2应指向其反方向。"""
+        laser_data = np.array([0.05, 0.20, 0.20, 0.20], dtype=float)
+        laser_angles = np.array([0.0, np.pi / 2, np.pi, 3 * np.pi / 2], dtype=float)
+
+        v2 = self.calculator.compute_avoidance_vector(
+            laser_data, laser_angles, max_range=0.20
+        )
+
+        self.assertLess(v2[0], 0.0)
+        self.assertAlmostEqual(np.linalg.norm(v2), 1.0, places=6)
+
+    def test_avoidance_vector_is_zero_when_no_rays_are_shortened(self):
+        """所有激光都未缩短时，不应产生斥力方向。"""
+        laser_data = np.full(8, 0.20, dtype=float)
+        laser_angles = np.linspace(0.0, 2 * np.pi, 8, endpoint=False)
+
+        v2 = self.calculator.compute_avoidance_vector(
+            laser_data, laser_angles, max_range=0.20
+        )
+
+        np.testing.assert_allclose(v2, np.zeros(2), atol=1e-9)
+
     def test_reference_velocity_with_real_env(self):
         """在真实环境中计算参考速度"""
         env = MultiTarEnv(
@@ -376,6 +399,49 @@ class TestRewardIntegration(unittest.TestCase):
         self.assertGreater(sum(reward_info['capture_rewards']), 0.0)
         self.assertTrue(any(r > 0 for r in rewards[:env.num_hunters]))
 
+    def test_chase_reward_uses_distance_progress_and_heading_gate(self):
+        """Closing distance with good heading should yield positive chase reward."""
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=1, num_hunters=4,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        hunter = env.hunters[0]
+        target = env.targets[0]
+
+        env._prev_hunter_positions[id(hunter)] = np.array([0.20, 0.20], dtype=float)
+        env._prev_target_positions[id(target)] = np.array([0.60, 0.20], dtype=float)
+        hunter.position[:2] = np.array([0.30, 0.20], dtype=float)
+        target.position[:2] = np.array([0.60, 0.20], dtype=float)
+        hunter.velocity[:2] = np.array([0.05, 0.0], dtype=float)
+
+        chase_reward, progress, cosine_heading = env._compute_hunter_chase_reward(hunter, target)
+
+        self.assertGreater(progress, 0.0)
+        self.assertGreater(cosine_heading, 0.0)
+        self.assertGreater(chase_reward, 0.0)
+
+    def test_chase_reward_handles_missing_previous_positions(self):
+        """Missing prev values should degrade to zero progress instead of failing."""
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=1, num_hunters=4,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        hunter = env.hunters[0]
+        target = env.targets[0]
+
+        env._prev_hunter_positions = {}
+        env._prev_target_positions = {}
+        hunter.velocity[:2] = np.array([0.05, 0.0], dtype=float)
+
+        chase_reward, progress, _ = env._compute_hunter_chase_reward(hunter, target)
+
+        self.assertEqual(progress, 0.0)
+        self.assertEqual(chase_reward, 0.0)
+
     def test_training_phase_configuration_updates_switches_and_rewards(self):
         """Curriculum stage updates should reach the environment."""
         env = MultiTarEnv(
@@ -405,6 +471,46 @@ class TestRewardIntegration(unittest.TestCase):
         self.assertFalse(env.use_density_field)
         self.assertFalse(env.use_role_assignment)
         self.assertFalse(env.use_ref_velocity)
+
+    def test_escape_sector_reward_prefers_motion_inside_clear_sector(self):
+        """Target should receive higher reward when moving inside the clear sector."""
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=1, num_hunters=4,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        target = env.targets[0]
+
+        with patch('utils.find_largest_clear_band', return_value=(315.0, 45.0)):
+            target.velocity = np.array([0.01, 0.0, 0.0], dtype=float)
+            reward_inside = env._compute_escape_sector_reward(target)
+
+            target.velocity = np.array([0.0, 0.01, 0.0], dtype=float)
+            reward_outside = env._compute_escape_sector_reward(target)
+
+        self.assertGreater(reward_inside, reward_outside)
+        self.assertGreaterEqual(reward_inside, 0.0)
+
+    def test_escape_sector_reward_is_damped_for_wide_sector(self):
+        """Wide clear sectors should dilute directional reward smoothly, not hard-clip it."""
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=1, num_hunters=4,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        target = env.targets[0]
+        target.velocity = np.array([0.01, 0.0, 0.0], dtype=float)
+
+        with patch('utils.find_largest_clear_band', return_value=(315.0, 45.0)):
+            reward_narrow = env._compute_escape_sector_reward(target)
+
+        with patch('utils.find_largest_clear_band', return_value=(180.0, 157.5)):
+            reward_wide = env._compute_escape_sector_reward(target)
+
+        self.assertGreater(reward_narrow, reward_wide)
+        self.assertGreater(reward_wide, 0.0)
 
 
 class TestValidationConfigParsing(unittest.TestCase):

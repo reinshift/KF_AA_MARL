@@ -108,6 +108,9 @@ class MultiTarEnv:
         self.use_ref_velocity = use_ref_velocity
         self.capture_ends_episode = True
         self.current_stage_name = "default"
+        self.chase_progress_clip = 2.0 * self.v_max * self.time_step
+        self._prev_hunter_positions = {}
+        self._prev_target_positions = {}
 
     def configure_training_phase(self, stage_name=None, reward_config=None, ablation_config=None):
         """
@@ -141,6 +144,39 @@ class MultiTarEnv:
         multi_obs_info = []
         for obstacle in self.obstacles:
             multi_obs_info.append(obstacle._return_obs_info())
+
+    def _compute_hunter_chase_reward(self, hunter, target):
+        """
+        Distance-progress chase reward gated by heading quality.
+
+        If previous positions are unavailable, fall back to current positions so the
+        progress term becomes zero instead of introducing undefined values.
+        """
+        hunter_pos = hunter.position[:2]
+        target_pos = target.position[:2]
+        prev_hunter_pos = self._prev_hunter_positions.get(id(hunter), hunter_pos)
+        prev_target_pos = self._prev_target_positions.get(id(target), target_pos)
+
+        d_prev = np.linalg.norm(prev_target_pos - prev_hunter_pos)
+        d_curr = np.linalg.norm(target_pos - hunter_pos)
+        progress = np.clip(d_prev - d_curr, -self.chase_progress_clip, self.chase_progress_clip)
+
+        hunter_dir = hunter.velocity[:2]
+        hunter_dir_norm = np.linalg.norm(hunter_dir)
+        target_dir = target_pos - hunter_pos
+        target_dir_norm = np.linalg.norm(target_dir)
+        if hunter_dir_norm > 1e-6 and target_dir_norm > 1e-6:
+            cosine_heading = float(np.dot(hunter_dir, target_dir) / (hunter_dir_norm * target_dir_norm))
+        else:
+            cosine_heading = 0.0
+
+        if progress >= 0.0:
+            heading_factor = 0.25 + 0.75 * max(cosine_heading, 0.0)
+        else:
+            heading_factor = 1.0 + 0.75 * max(-cosine_heading, 0.0)
+
+        chase_reward = float(progress * heading_factor)
+        return chase_reward, float(progress), cosine_heading
 
     def reset(self):
         '''
@@ -205,6 +241,13 @@ class MultiTarEnv:
         # Assign initial roles to hunters
         self._assign_hunter_roles()
 
+        self._prev_hunter_positions = {
+            id(hunter): hunter.position[:2].copy() for hunter in self.hunters
+        }
+        self._prev_target_positions = {
+            id(target): target.position[:2].copy() for target in self.targets
+        }
+
         # Get initial observations
         h_obs, t_obs = self._get_observations()
 
@@ -221,6 +264,13 @@ class MultiTarEnv:
             rewards (list of float): Rewards for all agents.
             dones (list of bool): Done flags for all agents.
         """
+        self._prev_hunter_positions = {
+            id(hunter): hunter.position[:2].copy() for hunter in self.hunters
+        }
+        self._prev_target_positions = {
+            id(target): target.position[:2].copy() for target in self.targets
+        }
+
         # Apply actions to hunters
         for i, hunter in enumerate(self.hunters):
             hunter.move(actions[i], self.v_max)
@@ -384,17 +434,31 @@ class MultiTarEnv:
 
         # Precompute hunter positions for nearest hunters
         hunter_positions = np.array([hunter.position for hunter in self.hunters])
+        hunter_xy = hunter_positions[:, :2]
+        if len(hunter_positions) > 1:
+            hunter_pairwise = np.linalg.norm(
+                hunter_xy[:, None, :] - hunter_xy[None, :, :],
+                axis=2,
+            )
+            np.fill_diagonal(hunter_pairwise, np.inf)
+        else:
+            hunter_pairwise = None
+
+        target_positions = np.array([target.position for target in self.targets]) if self.targets else np.zeros((0, 3))
+        target_xy = target_positions[:, :2] if len(target_positions) else np.zeros((0, 2))
+        target_to_hunters = (
+            np.linalg.norm(target_xy[:, None, :] - hunter_xy[None, :, :], axis=2)
+            if len(target_positions) and len(hunter_positions)
+            else np.zeros((len(target_positions), len(hunter_positions)))
+        )
 
         # Compute observations for hunters
         for i, hunter in enumerate(self.hunters):
-            # Get other hunters' positions excluding itself
-            other_hunters = np.delete(hunter_positions, i, axis=0)
-            # Find two nearest hunters
-            if len(other_hunters) >= 2:
-                distances = np.linalg.norm(other_hunters[:, :2] - hunter.position[:2], axis=1)
-                nearest_indices = distances.argsort()[:2]
-                nearest_hunters = other_hunters[nearest_indices]
+            if len(hunter_positions) >= 3:
+                nearest_indices = np.argpartition(hunter_pairwise[i], 2)[:2]
+                nearest_hunters = hunter_positions[nearest_indices]
             else:
+                other_hunters = np.delete(hunter_positions, i, axis=0)
                 # If less than two other hunters, pad with zeros
                 nearest_hunters = np.zeros((2, 3))
                 if len(other_hunters) == 1:
@@ -429,15 +493,15 @@ class MultiTarEnv:
             h_obs.append(obs)
 
         # Precompute hunter positions for targets' observations
-        for target in self.targets:
+        for idx, target in enumerate(self.targets):
             # Get target's own position and velocity
             own_pos = target.position
             own_vel = target.velocity
 
             # Find three nearest hunters
-            distances = np.linalg.norm(hunter_positions[:, :2] - own_pos[:2], axis=1)
-            nearest_indices = distances.argsort()[:3]
-            nearest_hunters = hunter_positions[nearest_indices]
+            distances = target_to_hunters[idx]
+            nearest_indices = np.argpartition(distances, min(3, len(distances) - 1))[:3] if len(distances) > 0 else []
+            nearest_hunters = hunter_positions[nearest_indices] if len(distances) > 0 else np.zeros((0, 3))
             if len(nearest_hunters) < 3:
                 # Pad with zeros if less than 3 hunters
                 pad_size = 3 - len(nearest_hunters)
@@ -471,6 +535,66 @@ class MultiTarEnv:
             t_obs.append(obs)
 
         return h_obs, t_obs
+
+    @staticmethod
+    def _wrap_angle(angle):
+        return angle % (2 * np.pi)
+
+    @staticmethod
+    def _shortest_angular_distance(a, b):
+        diff = (a - b + np.pi) % (2 * np.pi) - np.pi
+        return diff
+
+    def _compute_escape_sector_reward(self, target):
+        """
+        Reward target motion directions that fall inside the largest clear escape sector.
+        The sector is computed with the existing VFH-style histogram, considering hunters,
+        boundaries, and obstacles.
+        """
+        v_actual = target.velocity[:2]
+        speed = np.linalg.norm(v_actual)
+        if speed < 1e-6:
+            return 0.0
+
+        hunter_positions = [tuple(h.position[:2]) for h in self.hunters]
+        histogram = utils.compute_histogram(
+            tuple(target.position[:2]),
+            hunter_positions,
+            self.L_sensor * 2,
+            max_range=self.L_sensor,
+            boundary_length=self.length,
+            obstacles=self.obstacles,
+        )
+        angles = np.arange(0, 2 * np.pi, np.pi / 16)
+        largest_escape_interval = utils.find_largest_clear_band(
+            histogram, angles, self.L_sensor
+        )
+        if largest_escape_interval is None:
+            return -1.0
+
+        start_deg, end_deg = largest_escape_interval
+        start = self._wrap_angle(np.deg2rad(start_deg))
+        end = self._wrap_angle(np.deg2rad(end_deg))
+        width = (end - start) % (2 * np.pi)
+        if width < 1e-6:
+            width = 2 * np.pi
+
+        center = self._wrap_angle(start + width / 2.0)
+        actual_angle = self._wrap_angle(np.arctan2(v_actual[1], v_actual[0]))
+        half_width = max(width / 2.0, 1e-6)
+        ratio = abs(self._shortest_angular_distance(actual_angle, center)) / half_width
+        normalized_width = float(np.clip(width / (2 * np.pi), 0.0, 1.0))
+        # Wide open sectors provide weak directional evidence, so attenuate the
+        # reward smoothly instead of hard-clipping it to zero at a threshold.
+        sector_weight = float(1.0 / (1.0 + np.exp(8.0 * (normalized_width - 0.55))))
+        concentration = 1.0 + 2.5 * sector_weight
+
+        if ratio <= 1.0:
+            directional_score = (1.0 - ratio) ** concentration
+        else:
+            directional_score = -min(ratio - 1.0, 1.0)
+
+        return float(sector_weight * directional_score)
 
     def _compute_rewards(self):
         """
@@ -521,19 +645,7 @@ class MultiTarEnv:
         for target, hunters in target_hunter_groups.items():
             # calculate chasing reward and ifrounded reward
             for hunter in hunters:
-                hunter_dir = hunter.velocity[:2]
-                hunter_dir_norm = np.linalg.norm(hunter_dir)
-                if hunter_dir_norm == 0:
-                    hunter_dir_unit = np.zeros(2)
-                else:
-                    hunter_dir_unit = hunter_dir / hunter_dir_norm
-                target_dir = target.position[:2] - hunter.position[:2]
-                target_dir_norm = np.linalg.norm(target_dir)
-                if target_dir_norm == 0:
-                    target_dir_unit = np.zeros(2)
-                else:
-                    target_dir_unit = target_dir / target_dir_norm
-                chase_reward = np.dot(hunter_dir_unit, target_dir_unit)
+                chase_reward, _, _ = self._compute_hunter_chase_reward(hunter, target)
                 hunter_index = hunter_index_map[id(hunter)]
                 rewards[hunter_index] += self.chase_reward_coeff * chase_reward
                 chase_rewards[hunter_index] += self.chase_reward_coeff * chase_reward
@@ -557,17 +669,7 @@ class MultiTarEnv:
                 rewards[self.num_hunters + target_index] += 0  # No additional reward if captured
                 continue
 
-            hunters = target_hunter_groups[target]
-            if len(hunters) != 0:
-                distances = [np.linalg.norm(target.position[:2] - hunter.position[:2]) for hunter in hunters]
-                nearest_distance = min(distances)
-            else:
-                nearest_distance = np.inf
-
-            if nearest_distance > self.escape_distance:
-                escape_reward = 0.1
-            else:
-                escape_reward = -0.1
+            escape_reward = self._compute_escape_sector_reward(target)
             rewards[self.num_hunters + target_index] += self.escape_reward_coeff * escape_reward
             escape_rewards[target_index] += self.escape_reward_coeff * escape_reward
 

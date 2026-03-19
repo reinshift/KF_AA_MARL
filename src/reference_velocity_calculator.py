@@ -58,30 +58,45 @@ class ReferenceVelocityCalculator:
         return escape_vector
     
     def compute_avoidance_vector(self, laser_data: np.ndarray,
-                                laser_angles: np.ndarray) -> np.ndarray:
+                                laser_angles: np.ndarray,
+                                max_range: Optional[float] = None) -> np.ndarray:
         """
         计算避障向量 v2，基于激光雷达数据
-        
-        选择激光距离最大的方向作为避障方向，即最安全的方向
+
+        将每条激光束的“缩短量”视为来自该方向的占据/危险强度：
+            shortened_i = max_range - distance_i
+        然后把这些缩短后的射线向量相加，取反得到斥力方向。
+        如果所有激光都未缩短，则返回零向量。
         
         参数:
             laser_data: 激光雷达距离数据，形状 (num_lasers,)
             laser_angles: 激光雷达角度数据，形状 (num_lasers,)
+            max_range: 激光最大量程，用于计算每条射线的缩短量
             
         返回:
             避障向量 [vx, vy]
         """
         if len(laser_data) == 0:
             return np.zeros(2)
-        
-        # 找到距离最大的激光方向
-        max_distance_idx = np.argmax(laser_data)
-        max_angle = laser_angles[max_distance_idx]
-        
-        # 将角度转换为单位向量
-        avoidance_vector = np.array([np.cos(max_angle), np.sin(max_angle)])
-        
-        return avoidance_vector
+
+        laser_data = np.asarray(laser_data, dtype=float)
+        laser_angles = np.asarray(laser_angles, dtype=float)
+        if max_range is None:
+            max_range = float(np.max(laser_data)) if len(laser_data) > 0 else 0.0
+        max_range = max(float(max_range), 1e-6)
+
+        shortened = np.clip(max_range - laser_data, 0.0, max_range)
+        if np.all(shortened <= 1e-9):
+            return np.zeros(2)
+
+        beam_dirs = np.column_stack((np.cos(laser_angles), np.sin(laser_angles)))
+        occupancy_vector = np.sum(shortened[:, None] * beam_dirs, axis=0)
+        repulsion_vector = -occupancy_vector
+        repulsion_norm = np.linalg.norm(repulsion_vector)
+        if repulsion_norm <= 1e-9:
+            return np.zeros(2)
+
+        return repulsion_vector / repulsion_norm
 
     def compute_reference_velocity(self, target, hunters: List,
                                     escape_zone_center: np.ndarray = None) -> np.ndarray:
@@ -117,7 +132,9 @@ class ReferenceVelocityCalculator:
             v1 = np.array([np.cos(angle), np.sin(angle)])
 
         # 计算避障向量
-        v2 = self.compute_avoidance_vector(target.lasers, target.lidar.angles)
+        v2 = self.compute_avoidance_vector(
+            target.lasers, target.lidar.angles, max_range=target.lidar.max_detect_d
+        )
 
         # 计算出口吸引力（近距离大，远距离小）
         v3 = np.zeros(2)

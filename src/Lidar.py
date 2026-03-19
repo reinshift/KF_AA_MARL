@@ -11,6 +11,8 @@ class Lidar:
         self.num_rays = num_rays
         self.obstacles = obstacles # global obstacle information
         self.angles = np.linspace(0, 2 * np.pi, num_rays)
+        self._cos_angles = np.cos(self.angles)
+        self._sin_angles = np.sin(self.angles)
         self.distances = np.full(num_rays, max_detect_d) # initial lasers' lengths
         self.isInObs = False # whether the agent is inside the obstacle
 
@@ -38,10 +40,17 @@ class Lidar:
                 self.isInObs = True
                 return
 
-        for i, angle in enumerate(self.angles):
-            for cylinder in self.obstacles:
+        for i in range(self.num_rays):
+            dx = self._cos_angles[i]
+            dy = self._sin_angles[i]
+
+            # Boundary is independent from obstacles; compute once per ray.
+            t_boundary = self._calculate_boundary_intersection(x0, y0, dx, dy, length)
+            if t_boundary is not None and t_boundary < self.distances[i]:
+                self.distances[i] = t_boundary
+
+            for cylinder in self.obstacles_near:
                 cx, cy, cz, r, h = cylinder._return_obs_info()
-                dx, dy = np.cos(angle), np.sin(angle)
                 a = dx**2 + dy**2
                 b = 2 * (dx * (x0 - cx) + dy * (y0 - cy))
                 c = (x0 - cx)**2 + (y0 - cy)**2 - r**2
@@ -57,10 +66,6 @@ class Lidar:
                             distance = t
                             if distance < self.distances[i]:
                                 self.distances[i] = distance
-                
-                t_boundary = self._calculate_boundary_intersection(x0, y0, dx, dy, length)
-                if t_boundary is not None and t_boundary < self.distances[i]:
-                    self.distances[i] = t_boundary
 
     def _calculate_boundary_intersection(self, x0, y0, dx, dy, length):
         t_values = []

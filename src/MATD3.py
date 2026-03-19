@@ -108,8 +108,9 @@ class MATD3Agent:
             self.critic_scheduler = None
 
     def select_action(self, obs, noise=True):
-        obs = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
-        action = self.actor(obs).detach().cpu().numpy().flatten()
+        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        with torch.inference_mode():
+            action = self.actor(obs).squeeze(0).cpu().numpy()
         if noise:
             noise_sample = self.noise.sample(action.shape).numpy()
             # print("action: ", action) # optional: print the action for debugging

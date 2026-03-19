@@ -1,0 +1,25 @@
+environment:
+  num_hunters: 6
+  num_targets: 2
+  num_obstacles: 5
+  env_length: 2.0
+
+model:
+  path: "paper_experiments/curriculum/models/ep_250"
+  h_actor_dim: 32
+  t_actor_dim: 36
+  action_dim: 2
+
+validation:
+  num_episodes: 1
+  max_steps: 150
+  save_frame_interval: 5
+
+random_seed: 42
+headless: true
+
+output:
+  save_images: false
+  save_video: true
+  save_logs: true
+  video_fps: 10
