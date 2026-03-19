@@ -11,6 +11,85 @@ import warnings
 from datetime import datetime
 warnings.filterwarnings("ignore")
 
+
+DEFAULT_CURRICULUM = {
+    'enabled': True,
+    'stages': [
+        {
+            'name': 'pursuit_avoidance',
+            'until_fraction': 0.30,
+            'reward': {
+                'capture_reward': 12.0,
+                'chase_reward_coeff': 0.6,
+                'escape_reward_coeff': 0.2,
+                'alignment_reward_coeff': 0.0,
+                'safe_penalty_coeff': 0.8,
+                'obstacle_interior_penalty': 1.2,
+                'distance_threshold': 0.02,
+            },
+            'ablation': {
+                'use_density_field': False,
+                'use_role_assignment': False,
+                'use_ref_velocity': False,
+            },
+        },
+        {
+            'name': 'assignment_enabled',
+            'until_fraction': 0.55,
+            'reward': {
+                'capture_reward': 12.0,
+                'chase_reward_coeff': 0.35,
+                'escape_reward_coeff': 0.3,
+                'alignment_reward_coeff': 0.0,
+                'safe_penalty_coeff': 0.6,
+                'obstacle_interior_penalty': 1.0,
+                'distance_threshold': 0.018,
+            },
+            'ablation': {
+                'use_density_field': True,
+                'use_role_assignment': False,
+                'use_ref_velocity': False,
+            },
+        },
+        {
+            'name': 'escape_guidance',
+            'until_fraction': 0.80,
+            'reward': {
+                'capture_reward': 10.0,
+                'chase_reward_coeff': 0.2,
+                'escape_reward_coeff': 0.6,
+                'alignment_reward_coeff': 0.1,
+                'safe_penalty_coeff': 0.45,
+                'obstacle_interior_penalty': 0.8,
+                'distance_threshold': 0.015,
+            },
+            'ablation': {
+                'use_density_field': True,
+                'use_role_assignment': False,
+                'use_ref_velocity': True,
+            },
+        },
+        {
+            'name': 'full_coordination',
+            'until_fraction': 1.00,
+            'reward': {
+                'capture_reward': 10.0,
+                'chase_reward_coeff': 0.1,
+                'escape_reward_coeff': 1.0,
+                'alignment_reward_coeff': 0.2,
+                'safe_penalty_coeff': 0.3,
+                'obstacle_interior_penalty': 0.5,
+                'distance_threshold': 0.012,
+            },
+            'ablation': {
+                'use_density_field': True,
+                'use_role_assignment': True,
+                'use_ref_velocity': True,
+            },
+        },
+    ],
+}
+
 def str2bool(v):
     if isinstance(v, bool):
         return v
@@ -20,6 +99,41 @@ def str2bool(v):
         return False
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
+
+
+def _clone_curriculum(curriculum):
+    if curriculum is None:
+        curriculum = DEFAULT_CURRICULUM
+    return {
+        'enabled': curriculum.get('enabled', True),
+        'stages': [dict(stage) for stage in curriculum.get('stages', [])],
+    }
+
+
+def resolve_curriculum_stage(curriculum, episode, total_episodes):
+    if not curriculum.get('enabled', True):
+        return None
+
+    progress = episode / max(total_episodes, 1)
+    stages = curriculum.get('stages', [])
+    if not stages:
+        return None
+
+    for stage in stages:
+        if progress <= stage.get('until_fraction', 1.0):
+            return stage
+    return stages[-1]
+
+
+def apply_curriculum_stage(env, stage):
+    if stage is None:
+        return "default"
+    env.configure_training_phase(
+        stage_name=stage.get('name'),
+        reward_config=stage.get('reward'),
+        ablation_config=stage.get('ablation'),
+    )
+    return stage.get('name', 'default')
 
 def main(args):
     set_global_seeds(args.seed)
@@ -35,6 +149,8 @@ def main(args):
                       t_actor_dim=args.t_actor_dim,
                       action_dim=args.action_dim,
                       visualize_lasers=args.visualizelaser)
+
+    curriculum = _clone_curriculum(getattr(args, 'curriculum', None))
 
     # Initialize agents for hunters and targets
     hunters = [MATD3Agent(obs_dim=args.h_actor_dim,
@@ -90,20 +206,40 @@ def main(args):
     data_dir = os.path.join(os.getcwd(), "data_train", timestamp)
     os.makedirs(data_dir, exist_ok=True)
 
-    # initialize CSV file
+    # initialize CSV file with extended columns
     rewards_csv_path = os.path.join(data_dir, "rewards.csv")
     with open(rewards_csv_path, mode='w', newline='') as csv_file:
         writer = csv.writer(csv_file)
-        writer.writerow(["episode", "total_reward_hunters", "total_reward_targets"])
+        writer.writerow(["episode", "stage", "steps", "capture_success",
+                         "total_reward_hunters", "total_reward_targets",
+                         "avg_chase_reward", "avg_capture_reward",
+                         "avg_escape_reward", "avg_alignment_reward",
+                         "avg_critic_loss", "avg_actor_loss"])
 
     update_counter = 0
     score_threshold = args.score_threshold
+    active_stage_name = None
     for episode in range(1, args.num_episodes + 1):
+        stage = resolve_curriculum_stage(curriculum, episode, args.num_episodes)
+        stage_name = apply_curriculum_stage(env, stage)
+        if stage_name != active_stage_name:
+            active_stage_name = stage_name
+            print(f"Switched curriculum stage -> {active_stage_name}")
+
         h_obs, t_obs = env.reset()
         episode_rewards_hunters = np.zeros(env.num_hunters)
         episode_rewards_targets = np.zeros(env.num_targets)
         done = False
         current_step = 1
+
+        # Per-episode tracking
+        episode_chase = []
+        episode_capture = []
+        episode_escape = []
+        episode_alignment = []
+        episode_critic_losses = []
+        episode_actor_losses = []
+        capture_success = False
 
         while (not done) and (current_step <= args.max_steps):
             actions_hunters = []
@@ -123,7 +259,13 @@ def main(args):
             actions = actions_hunters + actions_targets
 
             # execute all actions & interact with env
-            h_next_obs, t_next_obs, rewards, dones = env.step(actions)
+            h_next_obs, t_next_obs, rewards, dones, reward_info = env.step(actions)
+
+            # Track reward components
+            episode_chase.append(np.mean(reward_info['chase_rewards']))
+            episode_capture.append(np.mean(reward_info['capture_rewards']))
+            episode_escape.append(np.mean(reward_info['escape_rewards']))
+            episode_alignment.append(np.mean(reward_info['alignment_rewards']))
 
             if args.ifrender:
                 env.render()
@@ -147,7 +289,9 @@ def main(args):
             h_obs = h_next_obs
             t_obs = t_next_obs
 
-            done = all(dones)
+            done = any(dones)
+            if reward_info.get('capture_happened', False):
+                capture_success = True
 
             update_counter += 1
             if update_counter % args.update_freq == 0:
@@ -155,7 +299,10 @@ def main(args):
                     for _ in range(args.update_iterations):
                         batch = hunters_buffer.sample(args.batch_size)
                         for hunter in hunters:
-                            hunter.update(batch)
+                            losses = hunter.update(batch)
+                            if losses is not None:
+                                episode_critic_losses.append(losses[0])
+                                episode_actor_losses.append(losses[1])
                 if targets_buffer.size() >= args.min_buffer_size:
                     for _ in range(args.update_iterations):
                         batch = targets_buffer.sample(args.batch_size)
@@ -164,13 +311,31 @@ def main(args):
 
         total_reward_hunters = episode_rewards_hunters.sum()
         total_reward_targets = episode_rewards_targets.sum()
+        ep_steps = current_step - 1
+
+        # Compute averages for logging
+        avg_chase = np.mean(episode_chase) if episode_chase else 0.0
+        avg_capture = np.mean(episode_capture) if episode_capture else 0.0
+        avg_escape = np.mean(episode_escape) if episode_escape else 0.0
+        avg_alignment = np.mean(episode_alignment) if episode_alignment else 0.0
+        avg_critic_loss = np.mean(episode_critic_losses) if episode_critic_losses else 0.0
+        avg_actor_loss = np.mean(episode_actor_losses) if episode_actor_losses else 0.0
+
+        cap_str = "CAPTURED" if capture_success else ""
         print(f"Episode {episode}/{args.num_episodes}, "
-              f"Total Reward Hunters: {total_reward_hunters:.2f}, "
-              f"Total Reward Targets: {total_reward_targets:.2f}")
+              f"Stage: {active_stage_name}, "
+              f"Steps: {ep_steps}, "
+              f"H_Reward: {total_reward_hunters:.2f}, "
+              f"T_Reward: {total_reward_targets:.2f} "
+              f"{cap_str}")
 
         with open(rewards_csv_path, mode='a', newline='') as csv_file:
             writer = csv.writer(csv_file)
-            writer.writerow([episode, total_reward_hunters, total_reward_targets])
+            writer.writerow([episode, active_stage_name, ep_steps, int(capture_success),
+                             f"{total_reward_hunters:.4f}", f"{total_reward_targets:.4f}",
+                             f"{avg_chase:.4f}", f"{avg_capture:.4f}",
+                             f"{avg_escape:.4f}", f"{avg_alignment:.4f}",
+                             f"{avg_critic_loss:.6f}", f"{avg_actor_loss:.6f}"])
 
         # save model
         should_save = False
@@ -208,7 +373,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_hunters', type=int, default=6, help='number of hunters(>=3)')
     parser.add_argument('--num_targets', type=int, default=2, help='number of targets(>=1)')
     parser.add_argument('--h_actor_dim', type=int, default=32, help='dimension of hunters\' observation')
-    parser.add_argument('--t_actor_dim', type=int, default=31, help='dimension of targets\' observation')
+    parser.add_argument('--t_actor_dim', type=int, default=36, help='dimension of targets\' observation')
     parser.add_argument('--action_dim', type=int, default=2, help='action dimension')
     parser.add_argument('--a_max', type=float, default=0.01, help='maximum action value (km/s^-2)')
     parser.add_argument('--ifrender', type=str2bool, default=False, help='whether to render the environment')

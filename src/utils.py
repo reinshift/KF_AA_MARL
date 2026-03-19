@@ -33,18 +33,26 @@ def ray_segment_intersection(ray_origin, ray_dir, seg_start, seg_end):
             return (x, y)
     return None
 
-def compute_histogram(target_pos, multi_hunter_pos, distance, max_range=0.2):
+def compute_histogram(target_pos, multi_hunter_pos, distance, max_range=0.2,
+                      boundary_length=None, obstacles=None):
     '''
     Just like VFH (Vector Field Histogram)
+    Now also considers boundary walls and obstacles as blocking.
+    boundary_length: if provided, treat [0, boundary_length] square as walls
+    obstacles: list of obstacle objects with _return_obs_info() -> (x,y,z,r,h)
     '''
     tx, ty = target_pos
     angles = np.arange(0, 2 * math.pi, math.pi / 16)  # 32角度
     histogram = []
 
+    # 边界宽容系数：稍微缩小边界的有效阻挡范围，给target极限逃生空间
+    boundary_margin = 0.03  # target贴边时仍有一小段"缝隙"
+
     for angle in angles:
         ray_dir = (math.cos(angle), math.sin(angle))
         min_distance = max_range
 
+        # 检测hunter阻挡
         for hunter in multi_hunter_pos:
             hx, hy = hunter
             dx = tx - hx
@@ -58,6 +66,41 @@ def compute_histogram(target_pos, multi_hunter_pos, distance, max_range=0.2):
                 dist = math.hypot(intersection[0] - tx, intersection[1] - ty)
                 if dist < min_distance:
                     min_distance = dist
+
+        # 检测边界阻挡（带宽容）
+        if boundary_length is not None:
+            effective_min = boundary_margin
+            effective_max = boundary_length - boundary_margin
+            # 四条边界线段
+            boundary_segments = [
+                ((effective_min, effective_min), (effective_max, effective_min)),  # 下边
+                ((effective_max, effective_min), (effective_max, effective_max)),  # 右边
+                ((effective_max, effective_max), (effective_min, effective_max)),  # 上边
+                ((effective_min, effective_max), (effective_min, effective_min)),  # 左边
+            ]
+            for seg_s, seg_e in boundary_segments:
+                intersection = ray_segment_intersection(target_pos, ray_dir, seg_s, seg_e)
+                if intersection is not None:
+                    dist = math.hypot(intersection[0] - tx, intersection[1] - ty)
+                    if dist < min_distance:
+                        min_distance = dist
+
+        # 检测障碍物阻挡（圆柱体近似为正多边形线段）
+        if obstacles is not None:
+            for obs in obstacles:
+                cx, cy, cz, r, h = obs._return_obs_info()
+                # 用8段线段近似圆
+                num_segs = 8
+                for k in range(num_segs):
+                    a1 = 2 * math.pi * k / num_segs
+                    a2 = 2 * math.pi * (k + 1) / num_segs
+                    seg_s = (cx + r * math.cos(a1), cy + r * math.sin(a1))
+                    seg_e = (cx + r * math.cos(a2), cy + r * math.sin(a2))
+                    intersection = ray_segment_intersection(target_pos, ray_dir, seg_s, seg_e)
+                    if intersection is not None:
+                        dist = math.hypot(intersection[0] - tx, intersection[1] - ty)
+                        if dist < min_distance:
+                            min_distance = dist
 
         histogram.append(min_distance if min_distance < max_range else max_range)
 
@@ -104,17 +147,14 @@ def find_largest_clear_band(histogram, angles, max_range=20):
     
     return largest_interval
 
-def isRounded(target_pos, multi_hunter_pos, sense_radius, success_threshold, max_range=0.2):
+def isRounded(target_pos, multi_hunter_pos, sense_radius, success_threshold,
+              max_range=0.2, boundary_length=None, obstacles=None):
     '''
     Check if the target is rounded by hunters.
-    Args:
-        target_pos: (x, y)
-        multi_hunter_pos: [(x1,y1),(x2,y2),...,(xn,yn)]
-        sense_radius: sense radius of hunters
-        success_threshold: max escape angle in degrees
-        max_range: maximum sensing range
+    Now considers boundary walls and obstacles as blocking.
     '''
-    histogram = compute_histogram(target_pos, multi_hunter_pos, sense_radius * 2, max_range)
+    histogram = compute_histogram(target_pos, multi_hunter_pos, sense_radius * 2, max_range,
+                                  boundary_length=boundary_length, obstacles=obstacles)
     angles = np.arange(0, 2 * math.pi, math.pi / 16)
     largest_escape_interval = find_largest_clear_band(histogram, angles, max_range)
     if largest_escape_interval is None:

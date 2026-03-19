@@ -49,7 +49,7 @@ def build_train_args(config, continue_training=False):
         num_hunters=env.get('num_hunters', 6),
         num_targets=env.get('num_targets', 2),
         h_actor_dim=model.get('h_actor_dim', 32),
-        t_actor_dim=model.get('t_actor_dim', 33),
+        t_actor_dim=model.get('t_actor_dim', 36),
         action_dim=model.get('action_dim', 2),
         a_max=train.get('a_max', 0.01),
         ifrender=train.get('ifrender', False),
@@ -72,6 +72,7 @@ def build_train_args(config, continue_training=False):
         iforthogonalize=train.get('iforthogonalize', True),
         iflrdecay=train.get('iflrdecay', False),
         checkpoint=checkpoint,
+        curriculum=train.get('curriculum'),
     )
 
 
@@ -95,7 +96,7 @@ def run_test(config):
     set_global_seeds(seed)
 
     h_actor_dim = model_cfg.get('h_actor_dim', 32)
-    t_actor_dim = model_cfg.get('t_actor_dim', 33)
+    t_actor_dim = model_cfg.get('t_actor_dim', 36)
     action_dim = model_cfg.get('action_dim', 2)
 
     env = MultiTarEnv(
@@ -148,7 +149,7 @@ def run_test(config):
             h_actions = [h.select_action(h_obs[i], noise=False) for i, h in enumerate(hunters)]
             t_actions = [t.select_action(t_obs[i], noise=False) for i, t in enumerate(targets)]
 
-            h_obs, t_obs, rewards, dones = env.step(h_actions + t_actions)
+            h_obs, t_obs, rewards, dones, _reward_info = env.step(h_actions + t_actions)
             if trim_target_obs:
                 t_obs = [obs[:target_obs_dim] for obs in t_obs]
 

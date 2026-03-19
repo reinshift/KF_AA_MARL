@@ -16,6 +16,7 @@ import unittest
 import numpy as np
 import tempfile
 import json
+from unittest.mock import patch
 
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
@@ -38,7 +39,7 @@ class TestEnvironmentIntegration(unittest.TestCase):
             num_hunters=4,
             num_targets=2,
             h_actor_dim=32,
-            t_actor_dim=33,
+            t_actor_dim=36,
             action_dim=2,
             visualize_lasers=False
         )
@@ -54,9 +55,9 @@ class TestEnvironmentIntegration(unittest.TestCase):
         for obs in h_obs:
             self.assertEqual(len(obs), 32)
 
-        # Target obs: 3(pos) + 3(vel) + 3*3(nearest_hunters) + 16(laser) + 2(ref_vel) = 33
+        # Target obs: 3(pos) + 3(vel) + 3*3(nearest_hunters) + 16(laser) + 2(ref_vel) + 2(escape_dir) + 1(escape_dist) = 36
         for obs in t_obs:
-            self.assertEqual(len(obs), 33)
+            self.assertEqual(len(obs), 36)
 
     def test_step_cycle_runs_without_error(self):
         """验证完整的step循环不报错"""
@@ -66,7 +67,7 @@ class TestEnvironmentIntegration(unittest.TestCase):
         actions = [np.random.uniform(-0.01, 0.01, size=2)
                    for _ in range(self.env.num_hunters + self.env.num_targets)]
 
-        h_obs_next, t_obs_next, rewards, dones = self.env.step(actions)
+        h_obs_next, t_obs_next, rewards, dones, reward_info = self.env.step(actions)
 
         self.assertEqual(len(h_obs_next), self.env.num_hunters)
         self.assertEqual(len(t_obs_next), self.env.num_targets)
@@ -80,7 +81,7 @@ class TestEnvironmentIntegration(unittest.TestCase):
         for step in range(50):
             actions = [np.random.uniform(-0.01, 0.01, size=2)
                        for _ in range(self.env.num_hunters + self.env.num_targets)]
-            h_obs, t_obs, rewards, dones = self.env.step(actions)
+            h_obs, t_obs, rewards, dones, _ri = self.env.step(actions)
 
             # 检查无NaN
             for obs in h_obs:
@@ -146,7 +147,7 @@ class TestDensityFieldIntegration(unittest.TestCase):
         """使用真实的Hunter和Target对象测试目标分配"""
         env = MultiTarEnv(
             length=2.0, num_obstacle=3, num_hunters=4,
-            num_targets=2, h_actor_dim=32, t_actor_dim=33,
+            num_targets=2, h_actor_dim=32, t_actor_dim=36,
             action_dim=2, visualize_lasers=False
         )
         env.reset()
@@ -165,7 +166,7 @@ class TestDensityFieldIntegration(unittest.TestCase):
         """密度场值应为非负"""
         env = MultiTarEnv(
             length=2.0, num_obstacle=2, num_hunters=3,
-            num_targets=1, h_actor_dim=32, t_actor_dim=33,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
             action_dim=2, visualize_lasers=False
         )
         env.reset()
@@ -180,7 +181,7 @@ class TestDensityFieldIntegration(unittest.TestCase):
         """边际贡献应为非负"""
         env = MultiTarEnv(
             length=2.0, num_obstacle=2, num_hunters=4,
-            num_targets=1, h_actor_dim=32, t_actor_dim=33,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
             action_dim=2, visualize_lasers=False
         )
         env.reset()
@@ -237,7 +238,7 @@ class TestEscapeStrategyIntegration(unittest.TestCase):
         """在真实环境中计算参考速度"""
         env = MultiTarEnv(
             length=2.0, num_obstacle=2, num_hunters=4,
-            num_targets=1, h_actor_dim=32, t_actor_dim=33,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
             action_dim=2, visualize_lasers=False
         )
         env.reset()
@@ -280,7 +281,7 @@ class TestRoleAssignmentIntegration(unittest.TestCase):
         """在真实环境中测试角色分配"""
         env = MultiTarEnv(
             length=2.0, num_obstacle=2, num_hunters=4,
-            num_targets=1, h_actor_dim=32, t_actor_dim=33,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
             action_dim=2, visualize_lasers=False
         )
         env.reset()
@@ -300,7 +301,7 @@ class TestRoleAssignmentIntegration(unittest.TestCase):
         """chaser的target_position应为target当前位置"""
         env = MultiTarEnv(
             length=2.0, num_obstacle=2, num_hunters=4,
-            num_targets=1, h_actor_dim=32, t_actor_dim=33,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
             action_dim=2, visualize_lasers=False
         )
         env.reset()
@@ -329,7 +330,7 @@ class TestRewardIntegration(unittest.TestCase):
         """所有奖励值应为有限数"""
         env = MultiTarEnv(
             length=2.0, num_obstacle=3, num_hunters=4,
-            num_targets=2, h_actor_dim=32, t_actor_dim=33,
+            num_targets=2, h_actor_dim=32, t_actor_dim=36,
             action_dim=2, visualize_lasers=False
         )
         env.reset()
@@ -337,7 +338,7 @@ class TestRewardIntegration(unittest.TestCase):
         for _ in range(10):
             actions = [np.random.uniform(-0.01, 0.01, size=2)
                        for _ in range(env.num_hunters + env.num_targets)]
-            _, _, rewards, _ = env.step(actions)
+            _, _, rewards, _, _ = env.step(actions)
 
             for r in rewards:
                 self.assertTrue(np.isfinite(r), f"Non-finite reward: {r}")
@@ -355,6 +356,55 @@ class TestRewardIntegration(unittest.TestCase):
         v_opposite = np.array([-1.0, 0.0])
         cos_sim = np.dot(v_opposite, v_ref) / (np.linalg.norm(v_opposite) * np.linalg.norm(v_ref))
         self.assertLess(cos_sim, 0)
+
+
+    def test_capture_ends_episode_for_all_agents(self):
+        """Capture should terminate the entire episode instead of only the target."""
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=1, num_hunters=4,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+
+        actions = [np.zeros(2) for _ in range(env.num_hunters + env.num_targets)]
+        with patch('utils.isRounded', return_value=True):
+            _, _, rewards, dones, reward_info = env.step(actions)
+
+        self.assertTrue(all(dones))
+        self.assertTrue(reward_info['capture_happened'])
+        self.assertGreater(sum(reward_info['capture_rewards']), 0.0)
+        self.assertTrue(any(r > 0 for r in rewards[:env.num_hunters]))
+
+    def test_training_phase_configuration_updates_switches_and_rewards(self):
+        """Curriculum stage updates should reach the environment."""
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=1, num_hunters=4,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+
+        env.configure_training_phase(
+            stage_name='pursuit_only',
+            reward_config={
+                'capture_reward': 15.0,
+                'chase_reward_coeff': 0.4,
+                'distance_threshold': 0.025,
+            },
+            ablation_config={
+                'use_density_field': False,
+                'use_role_assignment': False,
+                'use_ref_velocity': False,
+            },
+        )
+
+        self.assertEqual(env.current_stage_name, 'pursuit_only')
+        self.assertEqual(env.capture_reward, 15.0)
+        self.assertEqual(env.chase_reward_coeff, 0.4)
+        self.assertEqual(env.distance_threshold, 0.025)
+        self.assertFalse(env.use_density_field)
+        self.assertFalse(env.use_role_assignment)
+        self.assertFalse(env.use_ref_velocity)
 
 
 class TestValidationConfigParsing(unittest.TestCase):

@@ -59,15 +59,19 @@ class ValidationPipeline:
         """
         self.config = self.load_config(config_path)
         self.output_dir = self._create_output_dir()
-        
+
         # Initialize environment and agents (will be set in load_model)
         self.env = None
         self.hunters = []
         self.targets = []
-        
+
         # Metrics storage
         self.episode_metrics = []
-        
+
+        # Headless mode: 不保存中间图片，直接从内存帧生成视频
+        self.headless = self.config.get('headless', False)
+        self._episode_frames = []  # 内存帧缓存
+
         # Setup Chinese font for matplotlib
         setup_chinese_font()
     
@@ -305,7 +309,10 @@ class ValidationPipeline:
             # 生成视频（如果启用）
             if self.config['output'].get('save_video', True):
                 print(f"  正在生成视频...")
-                self.generate_video(episode)
+                if self.headless:
+                    self._generate_video_from_frames(episode)
+                else:
+                    self.generate_video(episode)
         
         # 生成最终报告
         print("\n生成验证报告...")
@@ -471,7 +478,8 @@ class ValidationPipeline:
         # 获取保存帧的间隔
         save_frame_interval = self.config['validation'].get('save_frame_interval', 5)
         save_images = self.config['output'].get('save_images', True)
-        
+        self._episode_frames = []  # 清空内存帧缓存
+
         # 运行回合
         for step in range(max_steps):
             # 选择动作 (使用确定性策略进行验证，不添加噪声)
@@ -479,21 +487,27 @@ class ValidationPipeline:
             for i, hunter in enumerate(self.hunters):
                 action = hunter.select_action(h_obs[i], noise=False)
                 h_actions.append(action)
-            
+
             t_actions = []
             for i, target in enumerate(self.targets):
                 action = target.select_action(t_obs[i], noise=False)
                 t_actions.append(action)
-            
+
             # 合并动作: hunters first, then targets
             all_actions = h_actions + t_actions
-            
+
             # 执行动作
-            h_obs_next, t_obs_next, rewards, dones = self.env.step(all_actions)
-            
-            # 保存帧（如果需要）
-            if save_images and step % save_frame_interval == 0:
-                self.save_frame(self.env, episode, step)
+            h_obs_next, t_obs_next, rewards, dones, _reward_info = self.env.step(all_actions)
+
+            # 保存帧
+            if step % save_frame_interval == 0:
+                if self.headless:
+                    # 无头模式：渲染到内存帧
+                    frame = self._render_frame_to_array(self.env, episode, step)
+                    if frame is not None:
+                        self._episode_frames.append(frame)
+                elif save_images:
+                    self.save_frame(self.env, episode, step)
             
             # 分离hunter和target的奖励
             h_rewards = rewards[:self.env.num_hunters]
@@ -522,7 +536,11 @@ class ValidationPipeline:
                 break
         
         # 保存最后一帧
-        if save_images:
+        if self.headless:
+            frame = self._render_frame_to_array(self.env, episode, total_steps)
+            if frame is not None:
+                self._episode_frames.append(frame)
+        elif save_images:
             self.save_frame(self.env, episode, total_steps)
         
         # 计算指标
@@ -677,6 +695,84 @@ class ValidationPipeline:
         # 保存并关闭
         plt.savefig(filepath, dpi=100, bbox_inches='tight')
         plt.close(fig)
+
+    def _render_frame_to_array(self, env, episode: int, step: int):
+        """无头模式：渲染当前环境状态为内存图像数组"""
+        try:
+            fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+            ax.set_xlim(-0.05, env.length + 0.05)
+            ax.set_ylim(-0.05, env.length + 0.05)
+            ax.set_aspect('equal')
+            ax.set_title(f'Episode {episode+1} | Step {step}', fontsize=14)
+
+            # 边界
+            ax.plot([0, env.length, env.length, 0, 0],
+                    [0, 0, env.length, env.length, 0], 'k-', lw=2)
+
+            # 障碍物
+            for obs in env.obstacles:
+                cx, cy, _, r, _ = obs._return_obs_info()
+                circle = plt.Circle((cx, cy), r, color='gray', alpha=0.5)
+                ax.add_patch(circle)
+
+            # 逃逸区域
+            if hasattr(env, 'escape_zone_center'):
+                esc = plt.Circle(env.escape_zone_center, env.escape_zone_radius,
+                                 color='green', alpha=0.2, linestyle='--', linewidth=2, fill=True)
+                ax.add_patch(esc)
+                ax.annotate('EXIT', xy=env.escape_zone_center, ha='center', va='center',
+                            fontsize=10, color='green', fontweight='bold')
+
+            # 猎手
+            h_colors = ['#e74c3c', '#c0392b', '#e67e22', '#d35400', '#f39c12', '#e84393']
+            for i, hunter in enumerate(env.hunters):
+                c = h_colors[i % len(h_colors)]
+                # 轨迹
+                if hasattr(hunter, 'history_pos') and len(hunter.history_pos) > 1:
+                    traj = np.array(hunter.history_pos)
+                    ax.plot(traj[:, 0], traj[:, 1], '-', color=c, alpha=0.3, lw=1)
+                ax.plot(hunter.position[0], hunter.position[1], 'o', color=c,
+                        markersize=8, markeredgecolor='black', markeredgewidth=0.5)
+
+            # 目标
+            t_colors = ['#2ecc71', '#27ae60']
+            for i, target in enumerate(env.targets):
+                c = t_colors[i % len(t_colors)]
+                if hasattr(target, 'history_pos') and len(target.history_pos) > 1:
+                    traj = np.array(target.history_pos)
+                    ax.plot(traj[:, 0], traj[:, 1], '-', color=c, alpha=0.3, lw=1)
+                ax.plot(target.position[0], target.position[1], '^', color=c,
+                        markersize=10, markeredgecolor='black', markeredgewidth=0.5)
+
+            # 转为图像数组
+            fig.canvas.draw()
+            w, h_px = fig.canvas.get_width_height()
+            img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h_px, w, 3)
+            img = img.copy()  # 脱离buffer引用
+            plt.close(fig)
+            return img
+        except Exception as e:
+            print(f"警告: 渲染帧失败 (episode={episode}, step={step}): {str(e)}")
+            return None
+
+    def _generate_video_from_frames(self, episode: int):
+        """无头模式：从内存帧直接生成视频，不经过磁盘图片"""
+        if not self._episode_frames:
+            print(f"  警告: 无帧可用于生成视频")
+            return
+
+        video_path = os.path.join(self.get_output_subdir('videos'), f'episode_{episode}.mp4')
+        h_px, w, _ = self._episode_frames[0].shape
+        fps = self.config['output'].get('video_fps', 10)
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(video_path, fourcc, fps, (w, h_px))
+
+        for frame in self._episode_frames:
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+
+        writer.release()
+        self._episode_frames = []
+        print(f"  视频已生成: {video_path}")
     
     def generate_video(self, episode: int):
         """

@@ -83,18 +83,20 @@ class ReferenceVelocityCalculator:
         
         return avoidance_vector
 
-    def compute_reference_velocity(self, target, hunters: List) -> np.ndarray:
+    def compute_reference_velocity(self, target, hunters: List,
+                                    escape_zone_center: np.ndarray = None) -> np.ndarray:
         """
-        计算参考速度 v_ref = normalize(v1) + normalize(v2)
-        
-        处理边界情况:
-        - 如果没有hunter在感知范围内，使用随机方向或当前速度方向
-        - 如果向量为零，提供合理的默认行为
-        
+        计算参考速度 v_ref = normalize(v1) + normalize(v2) + w3 * normalize(v3)
+
+        v1: 逃逸向量（远离hunter）
+        v2: 避障向量（雷达最安全方向）
+        v3: 出口吸引力（朝逃逸区域）
+
         参数:
             target: Target对象
             hunters: Hunter对象列表
-            
+            escape_zone_center: 逃逸区域中心坐标 [x,y]，如果提供则加入出口吸引力
+
         返回:
             参考速度向量 [vx, vy]
         """
@@ -104,7 +106,7 @@ class ReferenceVelocityCalculator:
             distance = np.linalg.norm(hunter.position[:2] - target.position[:2])
             if distance < self.perception_range:
                 hunters_in_range.append(hunter)
-        
+
         # 计算逃逸向量
         if len(hunters_in_range) > 0:
             hunter_positions = [h.position for h in hunters_in_range]
@@ -113,34 +115,46 @@ class ReferenceVelocityCalculator:
             # 没有hunter在感知范围内，使用随机方向
             angle = np.random.uniform(0, 2 * np.pi)
             v1 = np.array([np.cos(angle), np.sin(angle)])
-        
+
         # 计算避障向量
         v2 = self.compute_avoidance_vector(target.lasers, target.lidar.angles)
-        
-        # 处理零向量情况
+
+        # 计算出口吸引力（近距离大，远距离小）
+        v3 = np.zeros(2)
+        w3 = 0.0
+        if escape_zone_center is not None:
+            escape_dir = escape_zone_center - target.position[:2]
+            escape_dist = np.linalg.norm(escape_dir)
+            if escape_dist > 1e-6:
+                v3 = escape_dir / escape_dist
+                # 对角线长度作为归一化参考
+                diag = np.sqrt(2) * 2.0  # 地图对角线约2.83
+                # 远距离权重低，近距离权重高
+                w3 = 0.5 * max(0.0, 1.0 - escape_dist / max(diag, 1e-6))
+
+        # 合成各分力（避障权重提高到1.5）
+        epsilon = 1e-6
         v1_norm = np.linalg.norm(v1)
         v2_norm = np.linalg.norm(v2)
-        
-        epsilon = 1e-6
-        
-        if v1_norm < epsilon and v2_norm < epsilon:
-            # 两个向量都为零，保持当前速度方向
+
+        v_ref = np.zeros(2)
+        if v1_norm > epsilon:
+            v_ref += v1 / v1_norm
+        if v2_norm > epsilon:
+            v_ref += 1.5 * (v2 / v2_norm)
+        if w3 > 0:
+            v_ref += w3 * v3
+
+        # 如果合力为零，保持当前速度方向
+        v_ref_norm = np.linalg.norm(v_ref)
+        if v_ref_norm < epsilon:
             current_vel_norm = np.linalg.norm(target.velocity[:2])
             if current_vel_norm > epsilon:
                 return target.velocity[:2] / current_vel_norm
             else:
-                # 默认向右
                 return np.array([1.0, 0.0])
-        elif v1_norm < epsilon:
-            # 只有v2有效
-            return v2 / v2_norm
-        elif v2_norm < epsilon:
-            # 只有v1有效
-            return v1 / v1_norm
-        else:
-            # 两个向量都有效，归一化后相加
-            v_ref = v1 / v1_norm + v2 / v2_norm
-            return v_ref
+
+        return v_ref
     
     def is_inside_obstacle(self, position: np.ndarray,
                           obstacles: List) -> bool:

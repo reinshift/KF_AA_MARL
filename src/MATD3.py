@@ -62,7 +62,8 @@ class Critic(nn.Module):
 
 class MATD3Agent:
     def __init__(self, obs_dim, action_dim, lr, gamma, tau, noise_std, device,
-                 iforthogonalize=False, noise_clip=0.5, a_max=0.04, if_lr_decay=False, total_episodes=500):
+                 iforthogonalize=False, noise_clip=0.5, a_max=0.04, if_lr_decay=False, total_episodes=500,
+                 policy_delay=2, grad_clip_norm=0.5):
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.gamma = gamma
@@ -71,6 +72,9 @@ class MATD3Agent:
         self.device = device
         self.noise_clip = noise_clip
         self.a_max = a_max
+        self.policy_delay = policy_delay
+        self.grad_clip_norm = grad_clip_norm
+        self._update_step = 0  # 用于延迟策略更新计数
 
         self.actor = Actor(obs_dim, action_dim, iforthogonalize, a_max).to(device)
         self.actor_target = copy.deepcopy(self.actor)
@@ -82,8 +86,26 @@ class MATD3Agent:
 
         self.noise = Normal(0, noise_std)
 
+        # Reward normalization (running mean/std)
+        self._reward_mean = 0.0
+        self._reward_var = 1.0
+        self._reward_count = 0
+
+        # lr decay
         self.if_lr_decay = if_lr_decay
         self.total_episodes = total_episodes
+        if if_lr_decay and total_episodes > 0:
+            self.actor_scheduler = optim.lr_scheduler.LambdaLR(
+                self.actor_optimizer,
+                lr_lambda=lambda step: max(0.1, 1 - step / (total_episodes * 100))
+            )
+            self.critic_scheduler = optim.lr_scheduler.LambdaLR(
+                self.critic_optimizer,
+                lr_lambda=lambda step: max(0.1, 1 - step / (total_episodes * 100))
+            )
+        else:
+            self.actor_scheduler = None
+            self.critic_scheduler = None
 
     def select_action(self, obs, noise=True):
         obs = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
@@ -99,8 +121,32 @@ class MATD3Agent:
             action = action * (self.a_max / action_norm)
         return action
 
+    def normalize_reward(self, rewards_np):
+        """Running mean/std reward normalization"""
+        batch_mean = rewards_np.mean()
+        batch_var = rewards_np.var()
+        batch_count = len(rewards_np)
+
+        # Welford online update
+        delta = batch_mean - self._reward_mean
+        total_count = self._reward_count + batch_count
+        if total_count == 0:
+            return rewards_np
+        self._reward_mean += delta * batch_count / total_count
+        m_a = self._reward_var * self._reward_count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta**2 * self._reward_count * batch_count / total_count
+        self._reward_var = m2 / total_count
+        self._reward_count = total_count
+
+        std = max(self._reward_var ** 0.5, 1e-6)
+        return (rewards_np - self._reward_mean) / std
+
     def update(self, batch):
         obs, actions, rewards, next_obs, dones = batch
+
+        # Reward normalization
+        rewards = self.normalize_reward(rewards)
 
         obs = torch.tensor(obs, dtype=torch.float32).to(self.device)
         actions = torch.tensor(actions, dtype=torch.float32).to(self.device)
@@ -126,35 +172,55 @@ class MATD3Agent:
         critic_loss = (current_q1 - target_q).pow(2).mean() + (current_q2 - target_q).pow(2).mean()
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip_norm)
         self.critic_optimizer.step()
 
-        # Update actor
-        actor_loss = -self.critic(obs, self.actor(obs))[0].mean()
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
+        # Delayed policy update (standard TD3: update actor every policy_delay steps)
+        self._update_step += 1
+        actor_loss_val = None
+        if self._update_step % self.policy_delay == 0:
+            actor_loss = -self.critic(obs, self.actor(obs))[0].mean()
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_clip_norm)
+            self.actor_optimizer.step()
+            actor_loss_val = actor_loss.item()
 
-        # lr decay
-        if self.if_lr_decay and self.total_episodes > 0:
-            self.actor_scheduler = torch.optim.lr_scheduler.LambdaLR(
-                self.actor_optimizer,
-                lr_lambda=lambda epoch: 1 - epoch / self.total_episodes
-            )
-            self.critic_scheduler = torch.optim.lr_scheduler.LambdaLR(
-                self.critic_optimizer,
-                lr_lambda=lambda epoch: 1 - epoch / self.total_episodes
-            )
-        else:
-            self.actor_scheduler = None
-            self.critic_scheduler = None
+            # Update target networks (only when actor updates)
+            self.soft_update(self.actor, self.actor_target, self.tau)
+            self.soft_update(self.critic, self.critic_target, self.tau)
 
-        # Update target networks
-        self.soft_update(self.actor, self.actor_target, self.tau)
-        self.soft_update(self.critic, self.critic_target, self.tau)
+        # lr decay step
+        if self.critic_scheduler:
+            self.critic_scheduler.step()
+        if self.actor_scheduler and actor_loss_val is not None:
+            self.actor_scheduler.step()
+
+        return critic_loss.item(), actor_loss_val
 
     def soft_update(self, source, target, tau):
         for target_param, source_param in zip(target.parameters(), source.parameters()):
             target_param.data.copy_(tau * source_param.data + (1.0 - tau) * target_param.data)
+
+    def save_checkpoint(self):
+        """导出完整训练状态（含optimizer和target网络）"""
+        return {
+            'actor': self.actor.state_dict(),
+            'critic': self.critic.state_dict(),
+            'actor_target': self.actor_target.state_dict(),
+            'critic_target': self.critic_target.state_dict(),
+            'actor_optimizer': self.actor_optimizer.state_dict(),
+            'critic_optimizer': self.critic_optimizer.state_dict(),
+        }
+
+    def load_checkpoint(self, state):
+        """恢复完整训练状态"""
+        self.actor.load_state_dict(state['actor'])
+        self.critic.load_state_dict(state['critic'])
+        self.actor_target.load_state_dict(state['actor_target'])
+        self.critic_target.load_state_dict(state['critic_target'])
+        self.actor_optimizer.load_state_dict(state['actor_optimizer'])
+        self.critic_optimizer.load_state_dict(state['critic_optimizer'])
 
     def save_model(self, save_dir, agent_id, agent_type):
         agent_folder = os.path.join(save_dir, f"{agent_type}_{agent_id}")
@@ -184,3 +250,24 @@ class MATD3Agent:
         self.critic.load_state_dict(torch.load(critic_path, map_location=self.device))
 
         print(f"Loaded {agent_type} {agent_id} models")
+
+
+def save_training_checkpoint(path, episode, hunters, targets, update_counter, best_score):
+    """保存完整训练状态到checkpoint文件，支持断点续训"""
+    torch.save({
+        'episode': episode,
+        'update_counter': update_counter,
+        'best_score': best_score,
+        'hunters': [h.save_checkpoint() for h in hunters],
+        'targets': [t.save_checkpoint() for t in targets],
+    }, path)
+
+
+def load_training_checkpoint(path, hunters, targets):
+    """从checkpoint恢复训练状态，返回 (episode, update_counter, best_score)"""
+    ckpt = torch.load(path, map_location='cpu')
+    for i, h in enumerate(hunters):
+        h.load_checkpoint(ckpt['hunters'][i])
+    for i, t in enumerate(targets):
+        t.load_checkpoint(ckpt['targets'][i])
+    return ckpt['episode'], ckpt['update_counter'], ckpt['best_score']
