@@ -5,7 +5,7 @@ environment:
   env_length: 2.0
 
 model:
-  path: "paper_experiments/curriculum/models/ep_250"
+  path: "paper_experiments/curriculum/models/ep_200"
   h_actor_dim: 32
   t_actor_dim: 36
   action_dim: 2

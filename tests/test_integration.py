@@ -257,6 +257,20 @@ class TestEscapeStrategyIntegration(unittest.TestCase):
 
         np.testing.assert_allclose(v2, np.zeros(2), atol=1e-9)
 
+    def test_exit_guidance_projects_to_feasible_direction_when_blocked(self):
+        """Blocked exit direction should be attenuated and projected to a clear nearby ray."""
+        laser_angles = np.array([0.0, np.pi / 2, np.pi, 3 * np.pi / 2], dtype=float)
+        laser_data = np.array([0.05, 0.20, 0.20, 0.20], dtype=float)
+        exit_dir = np.array([1.0, 0.0], dtype=float)
+
+        projected_vec, gate = self.calculator._compute_feasible_exit_guidance(
+            laser_data, laser_angles, exit_dir, max_range=0.20
+        )
+
+        self.assertLess(gate, 0.5)
+        self.assertLess(projected_vec[0], 0.5)
+        self.assertGreater(abs(projected_vec[1]), 0.5)
+
     def test_reference_velocity_with_real_env(self):
         """在真实环境中计算参考速度"""
         env = MultiTarEnv(
@@ -511,6 +525,28 @@ class TestRewardIntegration(unittest.TestCase):
 
         self.assertGreater(reward_narrow, reward_wide)
         self.assertGreater(reward_wide, 0.0)
+
+    def test_target_reward_penalizes_obstacle_proximity_before_collision(self):
+        """A target close to obstacles should already be penalized before entering one."""
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=1, num_hunters=4,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        target = env.targets[0]
+        target_index = env.num_hunters
+
+        target.lasers = np.full(env.num_lasers, env.L_sensor, dtype=float)
+        with patch('utils.isRounded', return_value=False):
+            rewards_open, _, _ = env._compute_rewards()
+
+        target.lasers = np.full(env.num_lasers, env.L_sensor, dtype=float)
+        target.lasers[0] = 0.02
+        with patch('utils.isRounded', return_value=False):
+            rewards_blocked, _, _ = env._compute_rewards()
+
+        self.assertLess(rewards_blocked[target_index], rewards_open[target_index])
 
 
 class TestValidationConfigParsing(unittest.TestCase):

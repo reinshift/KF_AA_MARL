@@ -65,7 +65,7 @@ EXPERIMENT_CONFIGS = {
     },
     'curriculum': {
         'description': 'curriculum training with staged coordination',
-        'num_episodes': 300,
+        'num_episodes': 200,
         'seed': 42,
         'save_interval': 50,
         'curriculum': {

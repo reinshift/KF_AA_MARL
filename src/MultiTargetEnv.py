@@ -80,6 +80,7 @@ class MultiTarEnv:
         # Target reference velocity reward coefficients
         self.alignment_reward_coeff = 0.5  # cosine similarity reward coefficient
         self.obstacle_interior_penalty = 0.3  # penalty for being inside obstacle (降低)
+        self.obstacle_proximity_penalty_coeff = 0.6
         
         # Density field allocator for target assignment
         self.density_allocator = DensityFieldAllocator(
@@ -127,6 +128,7 @@ class MultiTarEnv:
                 'safe_penalty_coeff',
                 'alignment_reward_coeff',
                 'obstacle_interior_penalty',
+                'obstacle_proximity_penalty_coeff',
                 'distance_threshold',
             ):
                 if attr in reward_config:
@@ -695,7 +697,15 @@ class MultiTarEnv:
             
             rewards[self.num_hunters + target_index] += self.alignment_reward_coeff * alignment_reward
             alignment_rewards[target_index] += self.alignment_reward_coeff * alignment_reward
-            
+
+            obstacle_warning_threshold = 0.6 * self.L_sensor
+            min_laser_length = float(np.min(target.lasers)) if len(target.lasers) > 0 else self.L_sensor
+            if min_laser_length < obstacle_warning_threshold:
+                proximity_ratio = (obstacle_warning_threshold - min_laser_length) / max(obstacle_warning_threshold, 1e-6)
+                rewards[self.num_hunters + target_index] -= (
+                    self.obstacle_proximity_penalty_coeff * proximity_ratio
+                )
+
             # Add obstacle interior penalty
             if self.ref_velocity_calculator.is_inside_obstacle(target.position, self.obstacles):
                 rewards[self.num_hunters + target_index] -= self.obstacle_interior_penalty

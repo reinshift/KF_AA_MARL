@@ -27,6 +27,48 @@ class ReferenceVelocityCalculator:
             perception_range: target的感知范围，只考虑此范围内的hunter
         """
         self.perception_range = perception_range
+
+    @staticmethod
+    def _wrap_to_pi(angle: float) -> float:
+        return (angle + np.pi) % (2 * np.pi) - np.pi
+
+    def _compute_feasible_exit_guidance(self, laser_data: np.ndarray,
+                                        laser_angles: np.ndarray,
+                                        exit_direction: np.ndarray,
+                                        max_range: float) -> tuple[np.ndarray, float]:
+        """
+        Project exit attraction onto a locally feasible ray and attenuate its weight
+        when the direct path is obstructed.
+        """
+        exit_norm = np.linalg.norm(exit_direction)
+        if exit_norm <= 1e-6 or len(laser_data) == 0:
+            return np.zeros(2), 0.0
+
+        laser_data = np.asarray(laser_data, dtype=float)
+        laser_angles = np.asarray(laser_angles, dtype=float)
+        max_range = max(float(max_range), 1e-6)
+        exit_unit = exit_direction / exit_norm
+        exit_angle = float(np.arctan2(exit_unit[1], exit_unit[0]))
+
+        angle_diffs = np.array([self._wrap_to_pi(a - exit_angle) for a in laser_angles], dtype=float)
+        direct_idx = int(np.argmin(np.abs(angle_diffs)))
+        direct_clearance = float(np.clip(laser_data[direct_idx] / max_range, 0.0, 1.0))
+
+        feasible_threshold = 0.65 * max_range
+        feasible_mask = laser_data >= feasible_threshold
+        if np.any(feasible_mask):
+            feasible_indices = np.where(feasible_mask)[0]
+            best_idx = int(feasible_indices[np.argmin(np.abs(angle_diffs[feasible_indices]))])
+            projected_angle = float(laser_angles[best_idx])
+            angular_alignment = max(0.0, np.cos(self._wrap_to_pi(projected_angle - exit_angle)))
+            feasibility_gate = direct_clearance * (0.35 + 0.65 * angular_alignment)
+        else:
+            best_idx = direct_idx
+            projected_angle = float(laser_angles[best_idx])
+            feasibility_gate = direct_clearance ** 2
+
+        projected_vector = np.array([np.cos(projected_angle), np.sin(projected_angle)], dtype=float)
+        return projected_vector, float(np.clip(feasibility_gate, 0.0, 1.0))
     
     def compute_escape_vector(self, target_pos: np.ndarray,
                              hunter_positions: List[np.ndarray]) -> np.ndarray:
@@ -136,18 +178,20 @@ class ReferenceVelocityCalculator:
             target.lasers, target.lidar.angles, max_range=target.lidar.max_detect_d
         )
 
-        # 计算出口吸引力（近距离大，远距离小）
+        # 计算出口吸引力（近距离大，远距离小），并对被障碍阻挡的方向做可行性门控
         v3 = np.zeros(2)
         w3 = 0.0
         if escape_zone_center is not None:
             escape_dir = escape_zone_center - target.position[:2]
             escape_dist = np.linalg.norm(escape_dir)
             if escape_dist > 1e-6:
-                v3 = escape_dir / escape_dist
+                v3, exit_gate = self._compute_feasible_exit_guidance(
+                    target.lasers, target.lidar.angles, escape_dir, target.lidar.max_detect_d
+                )
                 # 对角线长度作为归一化参考
                 diag = np.sqrt(2) * 2.0  # 地图对角线约2.83
                 # 远距离权重低，近距离权重高
-                w3 = 0.5 * max(0.0, 1.0 - escape_dist / max(diag, 1e-6))
+                w3 = 0.5 * max(0.0, 1.0 - escape_dist / max(diag, 1e-6)) * exit_gate
 
         # 合成各分力（避障权重提高到1.5）
         epsilon = 1e-6
