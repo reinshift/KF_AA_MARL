@@ -4,6 +4,12 @@
 
 本项目实现了基于多智能体双延迟深度确定性策略梯度（MATD3）算法的追逃博弈仿真，包含多个追击者和逃逸者在带有障碍物的2D环境（伪3D，可以扩展到3D）中的对抗场景。
 
+系统包含以下核心增强功能：
+- 基于密度场的目标分配机制（综合聚集效应、速度匹配、障碍物衰减）
+- 基于参考速度矢量的智能逃逸策略（逃逸向量 + 避障向量）
+- 基于卡尔曼滤波的hunter角色分配（chaser/interceptor协同）
+- 自动化验证流水线（支持YAML/JSON配置、批量验证、视频生成）
+
 <div align="center">
     <img src="./output/trajectory_1_20250514_134509.png" width="400" alt="bev">
 </div>
@@ -24,27 +30,27 @@
 
 ```
 KF_AA_MARL/
+├── run.py               # 统一入口脚本
+├── config.yaml          # 统一配置文件
 ├── data_train/          # 训练日志和数据
 ├── model/               # 模型检查点保存目录
-├── run.py               # 主入口脚本
-├── scripts/             # 训练测试脚本
-│   ├── train.bat        # Windows训练脚本
-│   ├── train.sh         # Linux/Mac训练脚本
-│   ├── test.bat         # Windows测试脚本
-│   ├── test.sh          # Linux/Mac测试脚本
-│   ├── train_continue.bat # Windows继续训练
-│   ├── train_continue.sh # Linux/Mac继续训练
-│   ├── plot.bat         # Windows绘制曲线
-│   └── plot.sh          # Linux/Mac绘制曲线
+├── output/              # 验证输出目录
+├── scripts/             # 备用shell脚本
+├── tests/               # 集成测试
+│   └── test_integration.py
 └── src/                 # 源代码
-    ├── main.py          # 主函数
-    ├── test_model.py    # 测试模型代码
-    ├── plotcurve.py     # 绘制曲线代码
+    ├── main.py          # 训练主函数
+    ├── plotcurve.py     # 绘制曲线
     ├── MultiTargetEnv.py # 强化学习环境
     ├── MATD3.py         # MATD3算法
     ├── replaybuffer.py  # 经验回放区
     ├── Lidar.py         # 模拟的雷达传感器
-    └── utils.py         # 使用函数方法等
+    ├── utils.py         # 工具函数
+    ├── density_field_allocator.py  # 密度场目标分配器
+    ├── reference_velocity_calculator.py  # 参考速度计算器
+    ├── kalman_filter.py  # 卡尔曼滤波器
+    ├── role_assigner.py  # 角色分配器
+    └── validation_pipeline.py  # 验证流水线
 ```
 
 ## 安装指南
@@ -76,32 +82,47 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 ## 快速使用
 
-### 通过入口脚本运行（推荐）
-
-这是最简单的方式运行本项目:
+所有操作通过 `run.py` 统一入口，配置统一在 `config.yaml` 中管理：
 
 ```bash
-# 新训练
+# 训练
 python run.py train
 
-# 从已保存模型继续训练
+# 从已保存模型继续训练（需在config.yaml中设置training.checkpoint或model.path）
 python run.py train_continue
 
-# 测试预训练模型
+# 测试预训练模型（实时渲染）
 python run.py test
+
+# 运行验证流水线（批量测试 + 生成报告/视频）
+python run.py validate
+
+# 绘制训练奖励曲线
+python run.py plot
+python run.py plot --file_path "data_train/20241223_133158/rewards.csv"
+
+# 使用自定义配置文件
+python run.py train --config my_config.yaml
 ```
 
-如果有需要，可以前往具体的批处理文件(`scripts/*.batch` 或 `scripts/*.sh`)来自定义有关参数
+验证结果保存在 `output/{timestamp}_validation/` 目录，包含图片、视频、日志和配置备份。
 
-## 主要参数
+### 运行集成测试
 
-- `num_hunters`: 猎人数量（默认：6）
-- `num_targets`: 逃逸者数量（默认：2）
-- `num_obstacle`: 障碍物数 (default: 5)
-- `env_length`: 环境边界尺寸（单位：千米，默认：2.0）
-- `num_episodes`: 训练回合数（默认：500）
-- `max_steps`: 单回合最大步数 (默认：150)
-- `checkpoint`: 继续训练用到的已有模型保存路径
+```bash
+python -m unittest tests.test_integration -v
+```
+
+## 配置说明
+
+所有参数在 `config.yaml` 中统一管理，包含以下部分：
+
+- `environment`: 环境参数（hunter/target数量、障碍物、边长）
+- `model`: 模型路径和观测维度
+- `training`: 训练超参数（学习率、折扣因子、缓冲区大小等）
+- `test`: 测试参数（回合数、是否渲染）
+- `validation`: 验证流水线参数（回合数、帧间隔）
+- `output`: 输出配置（图片、视频、日志）
 
 ## 预训练模型
 
@@ -112,41 +133,26 @@ python run.py test
 
 ## 测试模式说明
 
-测试时支持两种可视化模式：
+测试模式加载训练好的模型并运行可视化：
 
-1. **实时渲染模式​​（默认）：**
-   - 设置 `--ifrender true` 可以实时渲染
-   - 可调整3D观察视角
-   - 提供即时行为反馈
+```bash
+python run.py test
+```
 
-2. **轨迹生成模式​​：**
-   - 设置 `--ifrender false`
-   - 自动生成鸟瞰轨迹图在`output/`
-   - 每张图展示整个回合的各个智能体移动路径
-   - 颜色标识：猎人（红色），逃逸者（绿色），起点（蓝色），终点（X标记）
-
-要使用轨迹生成模式，只要把ifrender参数从true调成false
-
-其他测试参数:
-- `--num_test_episodes`: 测试回合数 （默认：5）
-- `--visualizelaser`: 是否可视化激光雷达（默认：否）
-- `--seed`: 设置随机种子来测试泛化性（默认 10，这里有时候障碍物会随机生成到智能体位置，我暂时没有解决）
-
-轨迹图命名格式：`trajectory_{回合数}_{时间戳}.png`
+在 `config.yaml` 的 `test` 部分可配置：
+- `num_episodes`: 测试回合数（默认：5）
+- `ifrender`: 是否实时渲染（默认：true）
+- `visualizelaser`: 是否可视化激光雷达（默认：false）
+- `seed`: 随机种子（默认：10）
 
 ## 结果可视化
 
-训练结果保存在`data_train`目录。每次训练都会生成带时间戳的新文件夹，其中包含记录每个回合奖励的`rewards.csv`文件。
-
-可以运行如下命令来查看训练奖励曲线:
+训练结果保存在`data_train`目录。可以运行如下命令查看训练奖励曲线:
 
 ```bash
-# 绘制奖励曲线 (使用的是刚训练得到的模型)
 python run.py plot
-
-# 绘制奖励曲线（从具体的表格数据路径）
 python run.py plot --file_path "data_train/20241223_133158/rewards.csv"
 ```
 
 ## 作者注
-由于我没有训练好逃逸者（可以在图中看出来），并且部分功能（包括目标分配、猎人角色分配等）尚未实现，我已在代码中用#TODO标记。由于个人原因，我目前没有余力继续开发这些功能，有点遗憾，欢迎大家提交PR，如果我看到良好的分支，我会合并并将您列为项目贡献者：）
+本项目已实现密度场目标分配、参考速度逃逸策略、卡尔曼滤波角色分配和自动验证流水线等核心增强功能。目前模型训练效果仍有优化空间（详见 `system_evaluation.md`），欢迎大家提交PR，如果我看到良好的分支，我会合并并将您列为项目贡献者：）

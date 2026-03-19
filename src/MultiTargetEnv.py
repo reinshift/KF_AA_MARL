@@ -168,7 +168,6 @@ class MultiTarEnv:
 
         return h_obs,t_obs
 
-    # TODO!!!
     def step(self,actions):
         """
         Apply actions to agents, update the environment state, compute rewards, and return observations.
@@ -406,6 +405,10 @@ class MultiTarEnv:
         rewards = [0.0] * (self.num_hunters + self.num_targets)
         dones = [False] * (self.num_hunters + self.num_targets)
 
+        # Pre-compute index mappings to avoid repeated .index() calls
+        hunter_index_map = {id(h): i for i, h in enumerate(self.hunters)}
+        target_index_map = {id(t): i for i, t in enumerate(self.targets)}
+
         # Map each target to its assigned hunters
         target_hunter_groups = {}
         for target in self.targets:
@@ -416,30 +419,32 @@ class MultiTarEnv:
             # calculate chasing reward and ifrounded reward
             for hunter in hunters:
                 hunter_dir = hunter.velocity[:2]
-                if np.linalg.norm(hunter_dir) == 0:
+                hunter_dir_norm = np.linalg.norm(hunter_dir)
+                if hunter_dir_norm == 0:
                     hunter_dir_unit = np.zeros(2)
                 else:
-                    hunter_dir_unit = hunter_dir / np.linalg.norm(hunter_dir)
+                    hunter_dir_unit = hunter_dir / hunter_dir_norm
                 target_dir = target.position[:2] - hunter.position[:2]
-                if np.linalg.norm(target_dir) == 0:
+                target_dir_norm = np.linalg.norm(target_dir)
+                if target_dir_norm == 0:
                     target_dir_unit = np.zeros(2)
                 else:
-                    target_dir_unit = target_dir / np.linalg.norm(target_dir)
+                    target_dir_unit = target_dir / target_dir_norm
                 chase_reward = np.dot(hunter_dir_unit, target_dir_unit)
-                hunter_index = self.hunters.index(hunter)
+                hunter_index = hunter_index_map[id(hunter)]
                 rewards[hunter_index] += self.chase_reward_coeff * chase_reward
 
             multi_hunters_pos = [h.position for h in hunters]
             if utils.isRounded(tuple(target.position[:2]), [tuple(row[:2]) for row in multi_hunters_pos], self.L_sensor, self.max_escape_angle):
                 for hunter in hunters:
-                    hunter_index = self.hunters.index(hunter)
+                    hunter_index = hunter_index_map[id(hunter)]
                     rewards[hunter_index] += self.capture_reward
-                target_index = self.targets.index(target)
+                target_index = target_index_map[id(target)]
                 dones[self.num_hunters + target_index] = True  # to mark target as done
 
         # Reward for targets
         for target in self.targets:
-            target_index = self.targets.index(target)
+            target_index = target_index_map[id(target)]
             if dones[self.num_hunters + target_index]:
                 rewards[self.num_hunters + target_index] += 0  # No additional reward if captured
                 continue
@@ -495,8 +500,8 @@ class MultiTarEnv:
             for target in self.targets:
                 distance = np.linalg.norm(hunter.position[:2] - target.position[:2])
                 if distance < self.distance_threshold:
-                    rewards[self.hunters.index(hunter)] -= self.safe_penalty_coeff * (self.distance_threshold - distance)
-                    rewards[self.num_hunters + self.targets.index(target)] -= self.safe_penalty_coeff * (self.distance_threshold - distance)
+                    rewards[hunter_index_map[id(hunter)]] -= self.safe_penalty_coeff * (self.distance_threshold - distance)
+                    rewards[self.num_hunters + target_index_map[id(target)]] -= self.safe_penalty_coeff * (self.distance_threshold - distance)
         
         # between targets
         for i in range(self.num_targets):
@@ -519,9 +524,9 @@ class MultiTarEnv:
                 collision_penalty = 0.0
             
             if agent in self.hunters:
-                agent_index = self.hunters.index(agent)
+                agent_index = hunter_index_map[id(agent)]
             else:
-                agent_index = self.targets.index(agent) + self.num_hunters
+                agent_index = target_index_map[id(agent)] + self.num_hunters
             rewards[agent_index] += collision_penalty
 
         return rewards, dones

@@ -1,4 +1,8 @@
 numpy
 matplotlib==3.7.1
-panda
-gympillow
+pandas
+pillow
+gym
+pyyaml
+opencv-python
+hypothesis

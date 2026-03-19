@@ -94,8 +94,8 @@ class KalmanFilter:
         # 创新协方差: S = H * P * H^T + R
         S = self.H @ self.P @ self.H.T + self.R
         
-        # 卡尔曼增益: K = P * H^T * S^-1
-        K = self.P @ self.H.T @ np.linalg.inv(S)
+        # 卡尔曼增益: K = P * H^T * S^-1 (使用solve代替inv提高数值稳定性)
+        K = self.P @ self.H.T @ np.linalg.solve(S, np.eye(2, dtype=np.float64))
         
         # 状态更新: x = x + K * y
         self.x = self.x + K @ y

@@ -1,0 +1,64 @@
+# ============================================================================
+# KF_AA_MARL 统一配置文件
+# ============================================================================
+
+# 环境配置
+environment:
+  num_hunters: 6        # 追击者数量 (>=3)
+  num_targets: 2        # 逃逸者数量 (>=1)
+  num_obstacles: 5      # 障碍物数量
+  env_length: 2.0       # 环境边长 (km)
+
+# 模型配置
+model:
+  path: "model/20241223_133158_score_550"  # 模型路径（测试/验证/继续训练时使用）
+  h_actor_dim: 32       # Hunter观测维度
+  t_actor_dim: 33       # Target观测维度（含参考速度2维）
+  action_dim: 2         # 动作维度
+
+# 训练配置
+training:
+  seed: 10              # 随机种子
+  num_episodes: 500     # 训练回合数
+  max_steps: 150        # 单回合最大步数
+  lr: 5.0e-4            # 学习率
+  gamma: 0.95           # 折扣因子
+  tau: 0.01             # 目标网络更新率
+  noise_std: 0.005      # 探索噪声标准差
+  noise_clip: 0.01      # 目标策略噪声裁剪范围
+  a_max: 0.01           # 最大加速度 (km/s^2)
+  buffer_size: 10000    # 经验回放缓冲区大小
+  min_buffer_size: 1024 # 开始更新前的最小缓冲区大小
+  batch_size: 256       # 批量大小
+  update_freq: 10       # 网络更新频率（每N步更新一次）
+  update_iterations: 20 # 每次更新的迭代次数
+  save_frequency: 250   # 定期保存模型的频率（每N回合）
+  score_threshold: 500  # 保存模型的分数阈值
+  iforthogonalize: true # 是否正交初始化权重
+  iflrdecay: false      # 是否衰减学习率
+  ifrender: false       # 是否实时渲染
+  visualizelaser: false # 是否可视化激光雷达
+  checkpoint: null      # 继续训练时的模型路径（null表示从头训练）
+
+# 测试配置
+test:
+  num_episodes: 5       # 测试回合数
+  ifrender: true        # 是否实时渲染
+  visualizelaser: false # 是否可视化激光雷达
+  seed: 10              # 测试随机种子
+
+# 验证流水线配置
+validation:
+  num_episodes: 10      # 验证回合数
+  max_steps: 150        # 单回合最大步数
+  save_frame_interval: 5 # 帧保存间隔
+
+# 随机种子（验证流水线使用）
+random_seed: 42
+
+# 输出配置（验证流水线使用）
+output:
+  save_images: true     # 是否保存图片
+  save_video: true      # 是否生成视频
+  save_logs: true       # 是否保存日志
+  video_fps: 10         # 视频帧率
