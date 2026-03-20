@@ -17,6 +17,7 @@ import numpy as np
 import tempfile
 import json
 from unittest.mock import patch
+from types import SimpleNamespace
 
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
@@ -194,6 +195,26 @@ class TestDensityFieldIntegration(unittest.TestCase):
                 )
                 self.assertGreaterEqual(mc, 0.0)
 
+    def test_balanced_assignment_distributes_hunters_across_targets(self):
+        """With 6 hunters and 2 targets, balanced assignment should avoid collapsing to one target."""
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=0, num_hunters=6,
+            num_targets=2, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+
+        assignments = self.allocator.assign_targets(
+            env.hunters, env.targets, env.obstacles
+        )
+
+        counts = [0] * len(env.targets)
+        target_index = {id(target): idx for idx, target in enumerate(env.targets)}
+        for target in assignments.values():
+            counts[target_index[id(target)]] += 1
+
+        self.assertEqual(sorted(counts), [3, 3])
+
 
 class TestEscapeStrategyIntegration(unittest.TestCase):
     """测试逃逸策略与环境的集成"""
@@ -356,6 +377,26 @@ class TestRoleAssignmentIntegration(unittest.TestCase):
                     err_msg="Chaser should track target's current position"
                 )
 
+    def test_role_assignment_caps_interceptors(self):
+        """Role assignment should keep at least two chasers and cap interceptors."""
+        target = SimpleNamespace(
+            position=np.array([1.0, 1.0, 0.1], dtype=float),
+            velocity=np.array([-0.06, 0.0, 0.0], dtype=float),
+        )
+        hunters = [
+            SimpleNamespace(position=np.array([1.18, 1.0, 0.1], dtype=float)),
+            SimpleNamespace(position=np.array([1.24, 1.0, 0.1], dtype=float)),
+            SimpleNamespace(position=np.array([0.80, 1.0, 0.1], dtype=float)),
+        ]
+
+        with patch.object(self.assigner, 'predict_target_position', return_value=np.array([0.82, 1.0], dtype=float)):
+            roles = self.assigner.assign_roles(hunters, target)
+
+        interceptor_count = sum(1 for role in roles.values() if role == 'interceptor')
+        chaser_count = sum(1 for role in roles.values() if role == 'chaser')
+        self.assertLessEqual(interceptor_count, 1)
+        self.assertGreaterEqual(chaser_count, 2)
+
 
 class TestRewardIntegration(unittest.TestCase):
     """测试奖励函数的集成"""
@@ -413,6 +454,52 @@ class TestRewardIntegration(unittest.TestCase):
         self.assertGreater(sum(reward_info['capture_rewards']), 0.0)
         self.assertTrue(any(r > 0 for r in rewards[:env.num_hunters]))
 
+    def test_partial_capture_does_not_end_multi_target_episode(self):
+        """Capturing one target should not end the episode while another target remains active."""
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=1, num_hunters=4,
+            num_targets=2, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        env.targets[0].position[:2] = np.array([1.6, 1.6], dtype=float)
+        env.targets[1].position[:2] = np.array([1.7, 1.7], dtype=float)
+        for hunter in env.hunters:
+            hunter.assigned_target = env.targets[0]
+
+        with patch('utils.isRounded', side_effect=[True, False]):
+            rewards, dones, reward_info = env._compute_rewards()
+
+        self.assertFalse(reward_info['episode_terminal'])
+        self.assertFalse(reward_info['capture_happened'])
+        self.assertTrue(dones[env.num_hunters])
+        self.assertFalse(dones[env.num_hunters + 1])
+        self.assertEqual(env._get_target_state(env.targets[0]), 'captured')
+        self.assertEqual(env._get_target_state(env.targets[1]), 'active')
+        self.assertGreater(sum(reward_info['capture_rewards']), 0.0)
+
+    def test_episode_ends_only_after_all_targets_captured(self):
+        """Episode should terminate successfully only when the final active target is captured."""
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=1, num_hunters=4,
+            num_targets=2, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        env.targets[0].position[:2] = np.array([1.6, 1.6], dtype=float)
+        env.targets[1].position[:2] = np.array([1.7, 1.7], dtype=float)
+        env._set_target_state(env.targets[0], 'captured')
+        for hunter in env.hunters:
+            hunter.assigned_target = env.targets[1]
+
+        with patch('utils.isRounded', return_value=True):
+            rewards, dones, reward_info = env._compute_rewards()
+
+        self.assertTrue(all(dones))
+        self.assertTrue(reward_info['capture_happened'])
+        self.assertTrue(reward_info['all_targets_captured'])
+        self.assertEqual(env._get_target_state(env.targets[1]), 'captured')
+
     def test_chase_reward_uses_distance_progress_and_heading_gate(self):
         """Closing distance with good heading should yield positive chase reward."""
         env = MultiTarEnv(
@@ -469,6 +556,7 @@ class TestRewardIntegration(unittest.TestCase):
             reward_config={
                 'capture_reward': 15.0,
                 'chase_reward_coeff': 0.4,
+                'team_capture_bonus': 1.5,
                 'distance_threshold': 0.025,
             },
             ablation_config={
@@ -476,12 +564,21 @@ class TestRewardIntegration(unittest.TestCase):
                 'use_role_assignment': False,
                 'use_ref_velocity': False,
             },
+            mechanism_config={
+                'assignment_escape_pressure_coeff': 0.7,
+                'density_underloaded_priority': 1.8,
+                'max_interceptors_per_target': 0,
+            },
         )
 
         self.assertEqual(env.current_stage_name, 'pursuit_only')
         self.assertEqual(env.capture_reward, 15.0)
         self.assertEqual(env.chase_reward_coeff, 0.4)
+        self.assertEqual(env.team_capture_bonus, 1.5)
         self.assertEqual(env.distance_threshold, 0.025)
+        self.assertEqual(env.assignment_escape_pressure_coeff, 0.7)
+        self.assertEqual(env.density_allocator.underloaded_priority, 1.8)
+        self.assertEqual(env.role_assigner.max_interceptors_per_target, 0)
         self.assertFalse(env.use_density_field)
         self.assertFalse(env.use_role_assignment)
         self.assertFalse(env.use_ref_velocity)

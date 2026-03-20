@@ -147,17 +147,23 @@ def run_test(config):
         print(f"\n--- 测试回合 {ep + 1}/{num_episodes} ---")
         for step in range(max_steps):
             h_actions = [h.select_action(h_obs[i], noise=False) for i, h in enumerate(hunters)]
-            t_actions = [t.select_action(t_obs[i], noise=False) for i, t in enumerate(targets)]
+            t_actions = [
+                t.select_action(t_obs[i], noise=False) if env._is_target_active(env.targets[i]) else np.zeros(2, dtype=float)
+                for i, t in enumerate(targets)
+            ]
 
-            h_obs, t_obs, rewards, dones, _reward_info = env.step(h_actions + t_actions)
+            h_obs, t_obs, rewards, dones, reward_info = env.step(h_actions + t_actions)
             if trim_target_obs:
                 t_obs = [obs[:target_obs_dim] for obs in t_obs]
 
             if do_render:
                 env.render()
 
-            if any(dones):
-                print(f"  捕获成功! 步数: {step + 1}")
+            if reward_info.get('episode_terminal', False):
+                if reward_info.get('capture_happened', False):
+                    print(f"  捕获成功! 步数: {step + 1}")
+                else:
+                    print(f"  逃逸失败终止, 步数: {step + 1}")
                 break
         else:
             print(f"  未捕获, 达到最大步数 {max_steps}")

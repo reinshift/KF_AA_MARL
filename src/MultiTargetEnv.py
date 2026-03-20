@@ -76,19 +76,24 @@ class MultiTarEnv:
         self.chase_reward_coeff = 0.8    # chase reward coeff
         self.escape_reward_coeff = 0.4   # escape reward coeff
         self.safe_penalty_coeff = 0.15   # safe penalty coeff (降低，避免惩罚主导)
+        self.team_capture_bonus = 0.0
+        self.hunter_time_penalty_coeff = 0.0
 
         # Target reference velocity reward coefficients
         self.alignment_reward_coeff = 0.5  # cosine similarity reward coefficient
         self.obstacle_interior_penalty = 0.3  # penalty for being inside obstacle (降低)
         self.obstacle_proximity_penalty_coeff = 0.6
-        
+        self.assignment_escape_pressure_coeff = 0.0
+
         # Density field allocator for target assignment
         self.density_allocator = DensityFieldAllocator(
             h=0.1,      # kernel bandwidth
             alpha=0.5,  # velocity matching weight
             beta=0.3,   # obstacle attenuation strength
             sigma=0.05, # obstacle influence range
-            delta=1e-6  # small constant for utility calculation
+            delta=1e-6,  # small constant for utility calculation
+            underloaded_priority=1.2,
+            over_assignment_penalty=0.8,
         )
         
         # Reference velocity calculator for target escape strategy
@@ -100,7 +105,13 @@ class MultiTarEnv:
         self.role_assigner = RoleAssigner(
             dt=self.time_step,
             process_noise=0.01,
-            measurement_noise=0.1
+            measurement_noise=0.1,
+            min_group_size_for_interceptor=3,
+            max_interceptors_per_target=1,
+            min_target_speed=0.025,
+            min_interceptor_distance=0.12,
+            max_interceptor_distance=0.30,
+            prediction_steps=4,
         )
 
         # Ablation switches
@@ -112,8 +123,10 @@ class MultiTarEnv:
         self.chase_progress_clip = 2.0 * self.v_max * self.time_step
         self._prev_hunter_positions = {}
         self._prev_target_positions = {}
+        self.target_states = {}
 
-    def configure_training_phase(self, stage_name=None, reward_config=None, ablation_config=None):
+    def configure_training_phase(self, stage_name=None, reward_config=None, ablation_config=None,
+                                 mechanism_config=None):
         """
         Update reward weights and ablation switches for curriculum learning.
         """
@@ -129,6 +142,8 @@ class MultiTarEnv:
                 'alignment_reward_coeff',
                 'obstacle_interior_penalty',
                 'obstacle_proximity_penalty_coeff',
+                'team_capture_bonus',
+                'hunter_time_penalty_coeff',
                 'distance_threshold',
             ):
                 if attr in reward_config:
@@ -141,11 +156,42 @@ class MultiTarEnv:
                 self.use_role_assignment = ablation_config['use_role_assignment']
             if 'use_ref_velocity' in ablation_config:
                 self.use_ref_velocity = ablation_config['use_ref_velocity']
+
+        if mechanism_config:
+            if 'assignment_escape_pressure_coeff' in mechanism_config:
+                self.assignment_escape_pressure_coeff = mechanism_config['assignment_escape_pressure_coeff']
+            if 'density_underloaded_priority' in mechanism_config:
+                self.density_allocator.underloaded_priority = mechanism_config['density_underloaded_priority']
+            if 'density_over_assignment_penalty' in mechanism_config:
+                self.density_allocator.over_assignment_penalty = mechanism_config['density_over_assignment_penalty']
+            if 'min_group_size_for_interceptor' in mechanism_config:
+                self.role_assigner.min_group_size_for_interceptor = mechanism_config['min_group_size_for_interceptor']
+            if 'max_interceptors_per_target' in mechanism_config:
+                self.role_assigner.max_interceptors_per_target = mechanism_config['max_interceptors_per_target']
+            if 'min_target_speed_for_interceptor' in mechanism_config:
+                self.role_assigner.min_target_speed = mechanism_config['min_target_speed_for_interceptor']
+            if 'min_interceptor_distance' in mechanism_config:
+                self.role_assigner.min_interceptor_distance = mechanism_config['min_interceptor_distance']
+            if 'max_interceptor_distance' in mechanism_config:
+                self.role_assigner.max_interceptor_distance = mechanism_config['max_interceptor_distance']
+            if 'interceptor_prediction_steps' in mechanism_config:
+                self.role_assigner.prediction_steps = mechanism_config['interceptor_prediction_steps']
     
     def _collect_obs_info(self):
         multi_obs_info = []
         for obstacle in self.obstacles:
             multi_obs_info.append(obstacle._return_obs_info())
+
+    def _build_target_assignment_weights(self, targets):
+        if not targets:
+            return {}
+        diag = np.sqrt(2.0) * self.length
+        weights = {}
+        for target in targets:
+            dist_to_exit = np.linalg.norm(target.position[:2] - self.escape_zone_center)
+            escape_urgency = max(0.0, 1.0 - dist_to_exit / max(diag, 1e-6))
+            weights[id(target)] = 1.0 + self.assignment_escape_pressure_coeff * escape_urgency
+        return weights
 
     def _compute_hunter_chase_reward(self, hunter, target):
         """
@@ -179,6 +225,18 @@ class MultiTarEnv:
 
         chase_reward = float(progress * heading_factor)
         return chase_reward, float(progress), cosine_heading
+
+    def _set_target_state(self, target, state):
+        self.target_states[id(target)] = state
+
+    def _get_target_state(self, target):
+        return self.target_states.get(id(target), 'active')
+
+    def _is_target_active(self, target):
+        return self._get_target_state(target) == 'active'
+
+    def _get_active_targets(self):
+        return [target for target in self.targets if self._is_target_active(target)]
 
     def reset(self):
         '''
@@ -228,6 +286,7 @@ class MultiTarEnv:
             target.history_pos = []
             target.lasers = target.lidar.scan(target.position, self.length)
             target.reference_velocity = np.zeros(2)  # Initialize reference velocity
+            self._set_target_state(target, 'active')
 
         # Reset role assigner (clear Kalman filters)
         self.role_assigner.reset()
@@ -279,7 +338,10 @@ class MultiTarEnv:
         
         # Apply actions to targets
         for i, target in enumerate(self.targets):
-            target.move(actions[self.num_hunters + i], self.v_max) # Assume "action" set is combination of hunetrs' & targets'
+            if self._is_target_active(target):
+                target.move(actions[self.num_hunters + i], self.v_max) # Assume "action" set is combination of hunetrs' & targets'
+            else:
+                target.velocity = np.zeros(3)
 
         # Update lasers after movement
         for hunter in self.hunters:
@@ -289,7 +351,9 @@ class MultiTarEnv:
 
         # Update reference velocity for each target
         for target in self.targets:
-            if self.use_ref_velocity:
+            if not self._is_target_active(target):
+                target.reference_velocity = np.zeros(2)
+            elif self.use_ref_velocity:
                 # 完整引导速度：逃逸向量 + 避障向量 + 出口吸引力
                 target.reference_velocity = self.ref_velocity_calculator.compute_reference_velocity(
                     target, self.hunters, escape_zone_center=self.escape_zone_center)
@@ -318,8 +382,9 @@ class MultiTarEnv:
         
         # Update Kalman filters for all targets
         for target in self.targets:
-            target_id = id(target)
-            self.role_assigner.update_kalman_filter(target_id, target.position[:2])
+            if self._is_target_active(target):
+                target_id = id(target)
+                self.role_assigner.update_kalman_filter(target_id, target.position[:2])
         
         # Assign roles to hunters based on their assigned targets
         self._assign_hunter_roles()
@@ -336,12 +401,17 @@ class MultiTarEnv:
         """
         使用密度场分配器或最近距离为hunter分配目标
         """
-        if self.use_density_field:
+        active_targets = self._get_active_targets()
+        if not active_targets:
+            assignments = {}
+        elif self.use_density_field:
+            target_weights = self._build_target_assignment_weights(active_targets)
             # 使用密度场分配器计算最优分配
             assignments = self.density_allocator.assign_targets(
                 self.hunters,
-                self.targets,
-                self.obstacles
+                active_targets,
+                self.obstacles,
+                target_weights=target_weights,
             )
         else:
             # 消融模式：使用最近距离分配
@@ -417,7 +487,7 @@ class MultiTarEnv:
         """
         min_dist = float('inf')
         nearest = None
-        for target in self.targets:
+        for target in self._get_active_targets():
             dist = np.linalg.norm(hunter.position[:2] - target.position[:2])  # TODO: 2D distance -> 3D
             if dist < min_dist:
                 min_dist = dist
@@ -618,11 +688,23 @@ class MultiTarEnv:
         # Pre-compute index mappings to avoid repeated .index() calls
         hunter_index_map = {id(h): i for i, h in enumerate(self.hunters)}
         target_index_map = {id(t): i for i, t in enumerate(self.targets)}
-
-        # Map each target to its assigned hunters
-        target_hunter_groups = {}
         for target in self.targets:
+            if not self._is_target_active(target):
+                dones[self.num_hunters + target_index_map[id(target)]] = True
+
+        # Map each active target to its assigned hunters
+        target_hunter_groups = {}
+        for target in self._get_active_targets():
             target_hunter_groups[target] = [hunter for hunter in self.hunters if hunter.assigned_target == target]
+        group_sizes = [len(hunters) for hunters in target_hunter_groups.values()]
+        active_target_count_before = len(target_hunter_groups)
+        min_group_size = min(group_sizes) if group_sizes else 0
+        max_group_size = max(group_sizes) if group_sizes else 0
+        group_size_std = float(np.std(group_sizes)) if group_sizes else 0.0
+        interceptor_count = sum(
+            1 for hunter in self.hunters
+            if hunter.assigned_target is not None and hunter.role == 'interceptor'
+        )
 
         capture_happened = False
         captured_target_indices = []
@@ -631,10 +713,13 @@ class MultiTarEnv:
 
         # 检查逃逸区域
         for target in self.targets:
+            if not self._is_target_active(target):
+                continue
             target_index = target_index_map[id(target)]
             dist_to_escape = np.linalg.norm(target.position[:2] - self.escape_zone_center)
             if dist_to_escape <= self.escape_zone_radius:
                 # Target 到达逃逸区域，逃逸成功
+                self._set_target_state(target, 'escaped')
                 escape_happened = True
                 escaped_target_indices.append(target_index)
                 rewards[self.num_hunters + target_index] += self.escape_reward_for_target
@@ -660,15 +745,18 @@ class MultiTarEnv:
                     rewards[hunter_index] += self.capture_reward
                     capture_rewards[hunter_index] += self.capture_reward
                 target_index = target_index_map[id(target)]
-                dones[self.num_hunters + target_index] = True  # to mark target as done
-                capture_happened = True
+                self._set_target_state(target, 'captured')
+                dones[self.num_hunters + target_index] = True
                 captured_target_indices.append(target_index)
+
+        if captured_target_indices:
+            for i in range(self.num_hunters):
+                rewards[i] += self.team_capture_bonus * len(captured_target_indices)
 
         # Reward for targets
         for target in self.targets:
             target_index = target_index_map[id(target)]
-            if dones[self.num_hunters + target_index]:
-                rewards[self.num_hunters + target_index] += 0  # No additional reward if captured
+            if not self._is_target_active(target):
                 continue
 
             escape_reward = self._compute_escape_sector_reward(target)
@@ -710,6 +798,12 @@ class MultiTarEnv:
             if self.ref_velocity_calculator.is_inside_obstacle(target.position, self.obstacles):
                 rewards[self.num_hunters + target_index] -= self.obstacle_interior_penalty
 
+        active_target_count_after = len(self._get_active_targets())
+        if self.hunter_time_penalty_coeff > 0.0 and active_target_count_after > 0:
+            time_penalty = self.hunter_time_penalty_coeff * active_target_count_after
+            for i in range(self.num_hunters):
+                rewards[i] -= time_penalty
+
         # reward for safety (u-u)
         # between hunters
         for i in range(self.num_hunters):
@@ -723,24 +817,25 @@ class MultiTarEnv:
         # between hunters and targets — 不惩罚hunter靠近target（hunter应主动接近）
         # 只惩罚target被hunter碰撞
         for hunter in self.hunters:
-            for target in self.targets:
+            for target in self._get_active_targets():
                 distance = np.linalg.norm(hunter.position[:2] - target.position[:2])
                 if distance < self.distance_threshold:
                     rewards[self.num_hunters + target_index_map[id(target)]] -= self.safe_penalty_coeff * (self.distance_threshold - distance)
         
         # between targets
-        for i in range(self.num_targets):
-            for j in range(i+1, self.num_targets):
-                distance = np.linalg.norm(self.targets[i].position[:2] - self.targets[j].position[:2])
+        active_targets = self._get_active_targets()
+        for i in range(len(active_targets)):
+            for j in range(i+1, len(active_targets)):
+                distance = np.linalg.norm(active_targets[i].position[:2] - active_targets[j].position[:2])
                 if distance < self.distance_threshold:
                     penalty = self.safe_penalty_coeff * (self.distance_threshold - distance)
-                    rewards[self.num_hunters + i] -= penalty
-                    rewards[self.num_hunters + j] -= penalty
+                    rewards[self.num_hunters + target_index_map[id(active_targets[i])]] -= penalty
+                    rewards[self.num_hunters + target_index_map[id(active_targets[j])]] -= penalty
 
         # reward for safety (uav-obstacles)
         # Only penalize when very close to obstacles (< 50% of sensor range)
         obstacle_danger_threshold = self.L_sensor * 0.5
-        for agent in self.hunters + self.targets:
+        for agent in self.hunters + self._get_active_targets():
             min_laser_length = min(agent.lasers)
             if min_laser_length < obstacle_danger_threshold:
                 # Scaled penalty: 0 at threshold, max at 0
@@ -759,13 +854,28 @@ class MultiTarEnv:
             'capture_rewards': capture_rewards,
             'escape_rewards': escape_rewards,
             'alignment_rewards': alignment_rewards,
-            'capture_happened': capture_happened,
+            'capture_happened': False,
             'captured_targets': captured_target_indices,
             'escape_happened': escape_happened,
             'escaped_targets': escaped_target_indices,
             'stage_name': self.current_stage_name,
+            'active_target_count': active_target_count_after,
+            'min_group_size': min_group_size,
+            'max_group_size': max_group_size,
+            'group_size_std': group_size_std,
+            'interceptor_count': interceptor_count,
         }
-        if (capture_happened or escape_happened) and self.capture_ends_episode:
+        all_targets_captured = all(
+            self._get_target_state(target) == 'captured' for target in self.targets
+        )
+        any_target_escaped = any(
+            self._get_target_state(target) == 'escaped' for target in self.targets
+        )
+        capture_happened = all_targets_captured
+        reward_info['capture_happened'] = capture_happened
+        reward_info['all_targets_captured'] = all_targets_captured
+        reward_info['episode_terminal'] = all_targets_captured or any_target_escaped
+        if reward_info['episode_terminal'] and self.capture_ends_episode:
             dones = [True] * (self.num_hunters + self.num_targets)
         return rewards, dones, reward_info
     

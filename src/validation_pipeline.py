@@ -490,14 +490,17 @@ class ValidationPipeline:
 
             t_actions = []
             for i, target in enumerate(self.targets):
-                action = target.select_action(t_obs[i], noise=False)
+                if self.env._is_target_active(self.env.targets[i]):
+                    action = target.select_action(t_obs[i], noise=False)
+                else:
+                    action = np.zeros(2, dtype=float)
                 t_actions.append(action)
 
             # 合并动作: hunters first, then targets
             all_actions = h_actions + t_actions
 
             # 执行动作
-            h_obs_next, t_obs_next, rewards, dones, _reward_info = self.env.step(all_actions)
+            h_obs_next, t_obs_next, rewards, dones, reward_info = self.env.step(all_actions)
 
             # 保存帧
             if step % save_frame_interval == 0:
@@ -514,7 +517,7 @@ class ValidationPipeline:
             t_rewards = rewards[self.env.num_hunters:]
             
             # 检查done标志
-            done = any(dones)
+            done = reward_info.get('episode_terminal', False)
             
             # 调整target观测维度(如果需要)
             if trim_target_obs:
@@ -532,7 +535,7 @@ class ValidationPipeline:
             
             # 检查是否完成
             if done:
-                capture_success = True
+                capture_success = reward_info.get('capture_happened', False)
                 break
         
         # 保存最后一帧

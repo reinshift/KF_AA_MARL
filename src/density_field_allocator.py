@@ -36,8 +36,10 @@ class DensityFieldAllocator:
         - w_j: 目标权重
     """
     
-    def __init__(self, h: float = 0.1, alpha: float = 0.5, beta: float = 0.3, 
-                 sigma: float = 0.05, delta: float = 1e-6):
+    def __init__(self, h: float = 0.1, alpha: float = 0.5, beta: float = 0.3,
+                 sigma: float = 0.05, delta: float = 1e-6,
+                 underloaded_priority: float = 1.2,
+                 over_assignment_penalty: float = 0.8):
         """
         初始化密度场分配器
         
@@ -53,6 +55,8 @@ class DensityFieldAllocator:
         self.beta = beta
         self.sigma = sigma
         self.delta = delta
+        self.underloaded_priority = underloaded_priority
+        self.over_assignment_penalty = over_assignment_penalty
     
     def gaussian_kernel(self, distance: float) -> float:
         """
@@ -247,8 +251,38 @@ class DensityFieldAllocator:
         
         return utility
     
+    def _compute_desired_coverages(self, num_hunters: int, num_targets: int) -> List[int]:
+        """
+        Compute a balanced desired coverage plan for active targets.
+        """
+        if num_targets <= 0:
+            return []
+        base = num_hunters // num_targets
+        remainder = num_hunters % num_targets
+        desired = [base] * num_targets
+        for i in range(remainder):
+            desired[i] += 1
+        return desired
+
+    def _coverage_factor(self, current_count: int, desired_count: int) -> float:
+        """
+        Prefer under-covered targets and damp over-saturated ones.
+        """
+        if desired_count <= 0:
+            return 1.0 / (1.0 + self.over_assignment_penalty * max(current_count, 0))
+        if current_count < desired_count:
+            gap_ratio = (desired_count - current_count) / desired_count
+            return 1.0 + self.underloaded_priority * gap_ratio
+        overload = current_count - desired_count
+        return 1.0 / (1.0 + self.over_assignment_penalty * overload)
+
+    def _target_weight(self, target, target_weights: Optional[Dict[int, float]]) -> float:
+        if not target_weights:
+            return 1.0
+        return float(target_weights.get(id(target), 1.0))
+
     def assign_targets(self, hunters: List, targets: List,
-                      obstacles: List) -> Dict[int, object]:
+                      obstacles: List, target_weights: Optional[Dict[int, float]] = None) -> Dict[int, object]:
         """
         为所有hunter分配目标，返回 {hunter_id: target} 映射
         
@@ -265,24 +299,61 @@ class DensityFieldAllocator:
             字典 {hunter对象id: target对象}
         """
         assignments = {}
-        
-        for hunter in hunters:
-            max_utility = -float('inf')
+        if not hunters or not targets:
+            return assignments
+
+        desired_coverages = self._compute_desired_coverages(len(hunters), len(targets))
+        target_groups = {target: [] for target in targets}
+        remaining_hunters = list(hunters)
+        ordered_targets = sorted(
+            targets,
+            key=lambda target: self._target_weight(target, target_weights),
+            reverse=True,
+        )
+
+        # First pass: fill each target towards a balanced coverage level.
+        for coverage_round in range(max(desired_coverages) if desired_coverages else 0):
+            for target_index, target in enumerate(ordered_targets):
+                desired_count = desired_coverages[target_index]
+                current_group = target_groups[target]
+                if len(current_group) >= desired_count or not remaining_hunters:
+                    continue
+
+                best_hunter = None
+                best_score = -float('inf')
+                target_weight = self._target_weight(target, target_weights)
+                for hunter in remaining_hunters:
+                    utility = self.compute_utility(
+                        hunter, target, current_group, obstacles, w_j=target_weight
+                    )
+                    score = utility * self._coverage_factor(len(current_group), desired_count)
+                    if score > best_score:
+                        best_score = score
+                        best_hunter = hunter
+
+                if best_hunter is not None:
+                    assignments[id(best_hunter)] = target
+                    target_groups[target].append(best_hunter)
+                    remaining_hunters.remove(best_hunter)
+
+        # Second pass: assign any leftovers using utility with overload damping.
+        for hunter in remaining_hunters:
             best_target = None
-            
-            # 获取其他hunters
-            other_hunters = [h for h in hunters if h is not hunter]
-            
-            # 计算对每个target的效用
-            for target in targets:
-                utility = self.compute_utility(hunter, target, other_hunters, obstacles)
-                
-                if utility > max_utility:
-                    max_utility = utility
+            best_score = -float('inf')
+            for target_index, target in enumerate(ordered_targets):
+                current_group = target_groups[target]
+                target_weight = self._target_weight(target, target_weights)
+                desired_count = desired_coverages[target_index]
+                utility = self.compute_utility(
+                    hunter, target, current_group, obstacles, w_j=target_weight
+                )
+                score = utility * self._coverage_factor(len(current_group), desired_count)
+                if score > best_score:
+                    best_score = score
                     best_target = target
-            
-            # 分配最优target
+
             if best_target is not None:
                 assignments[id(hunter)] = best_target
-        
+                target_groups[best_target].append(hunter)
+
         return assignments

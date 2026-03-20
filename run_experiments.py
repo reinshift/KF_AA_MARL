@@ -64,82 +64,124 @@ EXPERIMENT_CONFIGS = {
         'save_interval': 25,
     },
     'curriculum': {
-        'description': 'curriculum training with staged coordination',
-        'num_episodes': 200,
+        'description': 'curriculum training with balanced coverage and gated coordination',
+        'num_episodes': 250,
         'seed': 42,
+        'max_steps': 200,
         'save_interval': 50,
         'curriculum': {
             'stages': [
                 {
                     'name': 'pursuit_avoidance',
-                    'until_fraction': 0.30,
+                    'until_fraction': 0.25,
                     'reward': {
                         'capture_reward': 12.0,
-                        'chase_reward_coeff': 0.6,
-                        'escape_reward_coeff': 0.2,
-                        'alignment_reward_coeff': 0.2,
-                        'safe_penalty_coeff': 0.8,
-                        'obstacle_interior_penalty': 1.2,
-                        'distance_threshold': 0.02,
+                        'team_capture_bonus': 1.5,
+                        'chase_reward_coeff': 1.4,
+                        'escape_reward_coeff': 0.15,
+                        'alignment_reward_coeff': 0.0,
+                        'safe_penalty_coeff': 0.45,
+                        'obstacle_interior_penalty': 0.8,
+                        'obstacle_proximity_penalty_coeff': 0.7,
+                        'hunter_time_penalty_coeff': 0.003,
+                        'distance_threshold': 0.018,
                     },
                     'ablation': {
                         'use_density_field': False,
                         'use_role_assignment': False,
                         'use_ref_velocity': False,
                     },
+                    'mechanism': {
+                        'assignment_escape_pressure_coeff': 0.0,
+                        'density_underloaded_priority': 0.8,
+                        'density_over_assignment_penalty': 0.4,
+                        'max_interceptors_per_target': 0,
+                    },
                 },
                 {
-                    'name': 'assignment_enabled',
+                    'name': 'balanced_assignment',
                     'until_fraction': 0.55,
                     'reward': {
                         'capture_reward': 12.0,
-                        'chase_reward_coeff': 0.35,
-                        'escape_reward_coeff': 0.3,
+                        'team_capture_bonus': 2.5,
+                        'chase_reward_coeff': 1.2,
+                        'escape_reward_coeff': 0.22,
                         'alignment_reward_coeff': 0.0,
-                        'safe_penalty_coeff': 0.6,
-                        'obstacle_interior_penalty': 1.0,
-                        'distance_threshold': 0.018,
+                        'safe_penalty_coeff': 0.35,
+                        'obstacle_interior_penalty': 0.7,
+                        'obstacle_proximity_penalty_coeff': 0.75,
+                        'hunter_time_penalty_coeff': 0.0035,
+                        'distance_threshold': 0.016,
                     },
                     'ablation': {
                         'use_density_field': True,
                         'use_role_assignment': False,
                         'use_ref_velocity': False,
                     },
+                    'mechanism': {
+                        'assignment_escape_pressure_coeff': 0.35,
+                        'density_underloaded_priority': 1.6,
+                        'density_over_assignment_penalty': 1.2,
+                        'max_interceptors_per_target': 0,
+                    },
                 },
                 {
                     'name': 'escape_guidance',
                     'until_fraction': 0.80,
                     'reward': {
-                        'capture_reward': 10.0,
-                        'chase_reward_coeff': 0.2,
-                        'escape_reward_coeff': 0.6,
-                        'alignment_reward_coeff': 0.5,
-                        'safe_penalty_coeff': 0.45,
-                        'obstacle_interior_penalty': 0.8,
-                        'distance_threshold': 0.015,
+                        'capture_reward': 14.0,
+                        'team_capture_bonus': 3.0,
+                        'chase_reward_coeff': 1.0,
+                        'escape_reward_coeff': 0.30,
+                        'alignment_reward_coeff': 0.25,
+                        'safe_penalty_coeff': 0.25,
+                        'obstacle_interior_penalty': 0.6,
+                        'obstacle_proximity_penalty_coeff': 0.85,
+                        'hunter_time_penalty_coeff': 0.004,
+                        'distance_threshold': 0.014,
                     },
                     'ablation': {
                         'use_density_field': True,
                         'use_role_assignment': False,
                         'use_ref_velocity': True,
                     },
+                    'mechanism': {
+                        'assignment_escape_pressure_coeff': 0.55,
+                        'density_underloaded_priority': 1.8,
+                        'density_over_assignment_penalty': 1.4,
+                        'max_interceptors_per_target': 0,
+                    },
                 },
                 {
                     'name': 'full_coordination',
                     'until_fraction': 1.00,
                     'reward': {
-                        'capture_reward': 10.0,
-                        'chase_reward_coeff': 0.1,
-                        'escape_reward_coeff': 1.0,
-                        'alignment_reward_coeff': 0.2,
-                        'safe_penalty_coeff': 0.3,
-                        'obstacle_interior_penalty': 0.5,
+                        'capture_reward': 16.0,
+                        'team_capture_bonus': 4.0,
+                        'chase_reward_coeff': 0.9,
+                        'escape_reward_coeff': 0.35,
+                        'alignment_reward_coeff': 0.20,
+                        'safe_penalty_coeff': 0.20,
+                        'obstacle_interior_penalty': 0.6,
+                        'obstacle_proximity_penalty_coeff': 0.90,
+                        'hunter_time_penalty_coeff': 0.005,
                         'distance_threshold': 0.012,
                     },
                     'ablation': {
                         'use_density_field': True,
                         'use_role_assignment': True,
                         'use_ref_velocity': True,
+                    },
+                    'mechanism': {
+                        'assignment_escape_pressure_coeff': 0.70,
+                        'density_underloaded_priority': 2.0,
+                        'density_over_assignment_penalty': 1.5,
+                        'min_group_size_for_interceptor': 3,
+                        'max_interceptors_per_target': 1,
+                        'min_target_speed_for_interceptor': 0.03,
+                        'min_interceptor_distance': 0.14,
+                        'max_interceptor_distance': 0.28,
+                        'interceptor_prediction_steps': 3,
                     },
                 },
             ],
@@ -260,15 +302,10 @@ def run_experiment(exp_name):
     # 应用奖励参数
     rw = config.get('reward')
     if rw:
-        env.capture_reward = rw['capture_reward']
-        env.chase_reward_coeff = rw['chase_reward_coeff']
-        env.escape_reward_coeff = rw['escape_reward_coeff']
-        env.alignment_reward_coeff = rw['alignment_reward_coeff']
-        env.safe_penalty_coeff = rw['safe_penalty_coeff']
-        env.obstacle_interior_penalty = rw['obstacle_interior_penalty']
+        env.configure_training_phase(reward_config=rw)
 
     num_episodes = config['num_episodes']
-    max_steps = 150
+    max_steps = config.get('max_steps', 150)
     save_interval = config['save_interval']
 
     hunters = [MATD3Agent(obs_dim=32, action_dim=2, lr=1e-3, gamma=0.95,
@@ -307,7 +344,10 @@ def run_experiment(exp_name):
                          "total_reward_hunters", "total_reward_targets",
                          "avg_chase_reward", "avg_capture_reward",
                          "avg_escape_reward", "avg_alignment_reward",
-                         "avg_critic_loss", "avg_actor_loss"])
+                         "avg_critic_loss", "avg_actor_loss",
+                         "avg_active_targets", "avg_min_group_size",
+                         "avg_max_group_size", "avg_group_size_std",
+                         "avg_interceptors"])
 
     # 随机预热：填充 buffer 后再开始训练
     if start_episode == 1:
@@ -316,15 +356,20 @@ def run_experiment(exp_name):
         h_obs, t_obs = env.reset()
         for _ in range(warmup_steps):
             ha = [np.random.uniform(-0.01, 0.01, 2) for _ in range(env.num_hunters)]
-            ta = [np.random.uniform(-0.01, 0.01, 2) for _ in range(env.num_targets)]
+            active_target_mask = [env._is_target_active(target) for target in env.targets]
+            ta = [
+                np.random.uniform(-0.01, 0.01, 2) if active_target_mask[i] else np.zeros(2, dtype=float)
+                for i in range(env.num_targets)
+            ]
             h_next, t_next, rewards, dones, ri = env.step(ha + ta)
             rh = rewards[:env.num_hunters]
             rt = rewards[env.num_hunters:]
             for i in range(env.num_hunters):
                 h_buffer.store_transition(h_obs[i], ha[i], rh[i], h_next[i], dones[i])
             for i in range(env.num_targets):
-                t_buffer.store_transition(t_obs[i], ta[i], rt[i], t_next[i], dones[env.num_hunters + i])
-            if any(dones):
+                if active_target_mask[i]:
+                    t_buffer.store_transition(t_obs[i], ta[i], rt[i], t_next[i], dones[env.num_hunters + i])
+            if ri.get('episode_terminal', any(dones)):
                 h_obs, t_obs = env.reset()
             else:
                 h_obs, t_obs = h_next, t_next
@@ -339,6 +384,7 @@ def run_experiment(exp_name):
                 stage_name=stage.get('name'),
                 reward_config=stage.get('reward'),
                 ablation_config=stage.get('ablation'),
+                mechanism_config=stage.get('mechanism'),
             )
             stage_name = stage.get('name', 'default')
 
@@ -348,19 +394,29 @@ def run_experiment(exp_name):
         done = False
         step = 0
         ep_chase, ep_capture, ep_escape, ep_align = [], [], [], []
+        ep_active_targets, ep_min_group, ep_max_group, ep_group_std, ep_interceptors = [], [], [], [], []
         ep_closs, ep_aloss = [], []
         capture = False
         escape = False
 
         while not done and step < max_steps:
             ha = [h.select_action(h_obs[i]) for i, h in enumerate(hunters)]
-            ta = [t.select_action(t_obs[i]) for i, t in enumerate(targets)]
+            active_target_mask = [env._is_target_active(target) for target in env.targets]
+            ta = [
+                t.select_action(t_obs[i]) if active_target_mask[i] else np.zeros(2, dtype=float)
+                for i, t in enumerate(targets)
+            ]
             h_next, t_next, rewards, dones, ri = env.step(ha + ta)
 
             ep_chase.append(np.mean(ri['chase_rewards']))
             ep_capture.append(np.mean(ri['capture_rewards']))
             ep_escape.append(np.mean(ri['escape_rewards']))
             ep_align.append(np.mean(ri['alignment_rewards']))
+            ep_active_targets.append(ri.get('active_target_count', env.num_targets))
+            ep_min_group.append(ri.get('min_group_size', 0))
+            ep_max_group.append(ri.get('max_group_size', 0))
+            ep_group_std.append(ri.get('group_size_std', 0.0))
+            ep_interceptors.append(ri.get('interceptor_count', 0))
 
             rh = rewards[:env.num_hunters]
             rt = rewards[env.num_hunters:]
@@ -368,12 +424,13 @@ def run_experiment(exp_name):
             for i in range(env.num_hunters):
                 h_buffer.store_transition(h_obs[i], ha[i], rh[i], h_next[i], dones[i])
             for i in range(env.num_targets):
-                t_buffer.store_transition(t_obs[i], ta[i], rt[i], t_next[i], dones[env.num_hunters + i])
+                if active_target_mask[i]:
+                    t_buffer.store_transition(t_obs[i], ta[i], rt[i], t_next[i], dones[env.num_hunters + i])
 
             ep_rh += rh
             ep_rt += rt
             h_obs, t_obs = h_next, t_next
-            done = any(dones)
+            done = ri.get('episode_terminal', any(dones))
             if ri.get('capture_happened', False):
                 capture = True
             if ri.get('escape_happened', False):
@@ -409,7 +466,12 @@ def run_experiment(exp_name):
                          f"{np.mean(ep_escape):.4f}" if ep_escape else "0",
                          f"{np.mean(ep_align):.4f}" if ep_align else "0",
                          f"{np.mean(ep_closs):.6f}" if ep_closs else "0",
-                         f"{np.mean(ep_aloss):.6f}" if ep_aloss else "0"])
+                         f"{np.mean(ep_aloss):.6f}" if ep_aloss else "0",
+                         f"{np.mean(ep_active_targets):.4f}" if ep_active_targets else "0",
+                         f"{np.mean(ep_min_group):.4f}" if ep_min_group else "0",
+                         f"{np.mean(ep_max_group):.4f}" if ep_max_group else "0",
+                         f"{np.mean(ep_group_std):.4f}" if ep_group_std else "0",
+                         f"{np.mean(ep_interceptors):.4f}" if ep_interceptors else "0"])
 
         cap_str = " CAPTURED" if capture else (" ESCAPED" if escape else "")
         if episode % 50 == 0 or capture or escape:

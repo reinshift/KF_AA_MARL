@@ -20,7 +20,14 @@ class RoleAssigner:
     - interceptor: 拦截者，预测并拦截target未来位置
     """
     
-    def __init__(self, dt: float = 0.5, process_noise: float = 0.01, measurement_noise: float = 0.1):
+    def __init__(self, dt: float = 0.5, process_noise: float = 0.01,
+                 measurement_noise: float = 0.1,
+                 min_group_size_for_interceptor: int = 3,
+                 max_interceptors_per_target: int = 1,
+                 min_target_speed: float = 0.025,
+                 min_interceptor_distance: float = 0.12,
+                 max_interceptor_distance: float = 0.30,
+                 prediction_steps: int = 4):
         """
         初始化角色分配器
         
@@ -32,6 +39,12 @@ class RoleAssigner:
         self.dt = dt
         self.process_noise = process_noise
         self.measurement_noise = measurement_noise
+        self.min_group_size_for_interceptor = min_group_size_for_interceptor
+        self.max_interceptors_per_target = max_interceptors_per_target
+        self.min_target_speed = min_target_speed
+        self.min_interceptor_distance = min_interceptor_distance
+        self.max_interceptor_distance = max_interceptor_distance
+        self.prediction_steps = prediction_steps
         
         # 为每个target维护一个卡尔曼滤波器
         # key: target的id (使用id(target))
@@ -57,36 +70,47 @@ class RoleAssigner:
         """
         if not hunters:
             return {}
-        
-        roles = {}
-        
-        # 预测target未来位置
-        predicted_pos = self.predict_target_position(target, steps_ahead=5)
-        
+
+        roles = {id(hunter): 'chaser' for hunter in hunters}
+        target_velocity = target.velocity[:2]
+        target_speed = np.linalg.norm(target_velocity)
+        if (
+            len(hunters) < self.min_group_size_for_interceptor
+            or target_speed < self.min_target_speed
+            or self.max_interceptors_per_target <= 0
+        ):
+            return roles
+
+        predicted_pos = self.predict_target_position(target, steps_ahead=self.prediction_steps)
+        target_dir = target_velocity / max(target_speed, 1e-6)
+        interceptor_candidates = []
+
         for hunter in hunters:
-            # 计算相对位置
             to_target = target.position[:2] - hunter.position[:2]
             distance = np.linalg.norm(to_target)
-            
-            # 计算hunter是否在target前方
-            # 前方定义：hunter在target运动方向的前方
-            target_velocity = target.velocity[:2]
-            is_ahead = False
-            
-            if np.linalg.norm(target_velocity) > 0.01:
-                # target有明显速度，判断hunter是否在前方
-                target_dir = target_velocity / np.linalg.norm(target_velocity)
-                # 如果to_target与target_dir的点积为负，说明hunter在target前方
-                dot_product = np.dot(to_target, target_dir)
-                is_ahead = dot_product < 0
-            
-            # 分配角色
-            # interceptor条件：在target前方且距离适中（0.1到0.4之间）
-            if is_ahead and 0.1 < distance < 0.4:
-                roles[id(hunter)] = 'interceptor'
-            else:
-                roles[id(hunter)] = 'chaser'
-        
+            if distance <= 1e-6:
+                continue
+
+            dot_product = np.dot(to_target, target_dir)
+            is_ahead = dot_product < 0.0
+            if not is_ahead:
+                continue
+            if not (self.min_interceptor_distance < distance < self.max_interceptor_distance):
+                continue
+
+            predicted_distance = np.linalg.norm(predicted_pos - hunter.position[:2])
+            ahead_margin = -dot_product / distance
+            candidate_score = ahead_margin - 0.25 * predicted_distance
+            interceptor_candidates.append((candidate_score, hunter))
+
+        max_interceptors = min(
+            self.max_interceptors_per_target,
+            max(0, len(hunters) - 2),
+        )
+        interceptor_candidates.sort(key=lambda item: item[0], reverse=True)
+        for _, hunter in interceptor_candidates[:max_interceptors]:
+            roles[id(hunter)] = 'interceptor'
+
         return roles
     
     def predict_target_position(self, target, steps_ahead: int = 5) -> np.ndarray:
@@ -164,7 +188,7 @@ class RoleAssigner:
             return target.position.copy()
         elif role == 'interceptor':
             # interceptor追踪预测的未来位置
-            predicted_pos_2d = self.predict_target_position(target, steps_ahead=5)
+            predicted_pos_2d = self.predict_target_position(target, steps_ahead=self.prediction_steps)
             # 添加z坐标（保持与target当前高度相同）
             target_pos_3d = np.array([
                 predicted_pos_2d[0],
