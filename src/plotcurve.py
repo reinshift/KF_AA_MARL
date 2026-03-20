@@ -4,6 +4,13 @@ import os
 import argparse
 import numpy as np
 
+
+def setup_chinese_font():
+    plt.rcParams['font.sans-serif'] = ['SimSun', 'DejaVu Sans']
+    plt.rcParams['font.family'] = 'sans-serif'
+    plt.rcParams['axes.unicode_minus'] = False
+
+
 def plot_rewards(file_path, window_size=5, save_plot=False, output_path=None):
     """
     Plot reward curves
@@ -34,12 +41,13 @@ def plot_rewards(file_path, window_size=5, save_plot=False, output_path=None):
             total_reward_targets_smooth = total_reward_targets
         
         # Create plot
+        setup_chinese_font()
         plt.figure(figsize=(12, 8))
         
         # Plot hunters rewards
         plt.subplot(2, 1, 1)
-        plt.plot(episodes, total_reward_hunters, 'b-', alpha=0.3, label='Raw Data')
-        plt.plot(episodes, total_reward_hunters_smooth, 'b-', label=f'Hunters Reward (window={window_size})')
+        plt.plot(episodes, total_reward_hunters, 'b-', alpha=0.3, label='原始数据')
+        plt.plot(episodes, total_reward_hunters_smooth, 'b-', label=f'追击者奖励（窗口={window_size}）')
         plt.title('Hunters Total Reward vs Episode')
         plt.xlabel('Episode')
         plt.ylabel('Hunters Total Reward')
@@ -48,8 +56,8 @@ def plot_rewards(file_path, window_size=5, save_plot=False, output_path=None):
         
         # Plot targets rewards
         plt.subplot(2, 1, 2)
-        plt.plot(episodes, total_reward_targets, 'r-', alpha=0.3, label='Raw Data')
-        plt.plot(episodes, total_reward_targets_smooth, 'r-', label=f'Targets Reward (window={window_size})')
+        plt.plot(episodes, total_reward_targets, 'r-', alpha=0.3, label='原始数据')
+        plt.plot(episodes, total_reward_targets_smooth, 'r-', label=f'逃逸者奖励（窗口={window_size}）')
         plt.title('Targets Total Reward vs Episode')
         plt.xlabel('Episode')
         plt.ylabel('Targets Total Reward')

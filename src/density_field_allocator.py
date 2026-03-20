@@ -39,7 +39,17 @@ class DensityFieldAllocator:
     def __init__(self, h: float = 0.1, alpha: float = 0.5, beta: float = 0.3,
                  sigma: float = 0.05, delta: float = 1e-6,
                  underloaded_priority: float = 1.2,
-                 over_assignment_penalty: float = 0.8):
+                 over_assignment_penalty: float = 0.8,
+                 density_value_weight: float = 1.0,
+                 target_proximity_weight: float = 2.6,
+                 slot_proximity_weight: float = 1.4,
+                 switch_penalty: float = 0.45,
+                 target_inertia_bonus: float = 0.35,
+                 slot_inertia_bonus: float = 0.20,
+                 target_distance_scale: float = 0.28,
+                 slot_distance_scale: float = 0.18,
+                 slot_radius: float = 0.12,
+                 slot_clearance_margin: float = 0.04):
         """
         初始化密度场分配器
         
@@ -57,6 +67,16 @@ class DensityFieldAllocator:
         self.delta = delta
         self.underloaded_priority = underloaded_priority
         self.over_assignment_penalty = over_assignment_penalty
+        self.density_value_weight = density_value_weight
+        self.target_proximity_weight = target_proximity_weight
+        self.slot_proximity_weight = slot_proximity_weight
+        self.switch_penalty = switch_penalty
+        self.target_inertia_bonus = target_inertia_bonus
+        self.slot_inertia_bonus = slot_inertia_bonus
+        self.target_distance_scale = target_distance_scale
+        self.slot_distance_scale = slot_distance_scale
+        self.slot_radius = slot_radius
+        self.slot_clearance_margin = slot_clearance_margin
     
     def gaussian_kernel(self, distance: float) -> float:
         """
@@ -281,8 +301,159 @@ class DensityFieldAllocator:
             return 1.0
         return float(target_weights.get(id(target), 1.0))
 
+    @staticmethod
+    def _safe_normalize(vector: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+        norm = float(np.linalg.norm(vector))
+        if norm <= eps:
+            return np.zeros(2, dtype=float)
+        return np.asarray(vector, dtype=float) / norm
+
+    def _build_slot_angles(self, desired_count: int) -> List[float]:
+        if desired_count <= 1:
+            return [0.0]
+        if desired_count == 2:
+            return list(np.deg2rad([-35.0, 35.0]))
+        if desired_count == 3:
+            return list(np.deg2rad([-65.0, 0.0, 65.0]))
+        if desired_count == 4:
+            return list(np.deg2rad([-95.0, -30.0, 30.0, 95.0]))
+        return list(np.deg2rad(np.linspace(-110.0, 110.0, desired_count)))
+
+    def _project_slot_position(
+        self,
+        point_xy: np.ndarray,
+        target_pos_xy: np.ndarray,
+        obstacles: List,
+        boundary_length: Optional[float] = None,
+    ) -> np.ndarray:
+        clearance = max(float(self.slot_clearance_margin), 1e-3)
+        point = np.asarray(point_xy, dtype=float).copy()
+        target_pos = np.asarray(target_pos_xy, dtype=float)
+        preferred = self._safe_normalize(point - target_pos)
+        if np.linalg.norm(preferred) <= 1e-6:
+            preferred = np.array([1.0, 0.0], dtype=float)
+
+        if boundary_length is not None:
+            point = np.clip(point, clearance, boundary_length - clearance)
+
+        for _ in range(8):
+            adjusted = False
+            if boundary_length is not None:
+                point = np.clip(point, clearance, boundary_length - clearance)
+            for obstacle in obstacles:
+                delta = point - obstacle.position[:2]
+                min_clearance = float(obstacle.radius + clearance)
+                distance = float(np.linalg.norm(delta))
+                if distance >= min_clearance:
+                    continue
+
+                adjusted = True
+                push_dir = self._safe_normalize(delta)
+                if np.linalg.norm(push_dir) <= 1e-6:
+                    push_dir = preferred
+                blended = self._safe_normalize(0.75 * push_dir + 0.25 * preferred)
+                if np.linalg.norm(blended) <= 1e-6:
+                    blended = preferred
+                point = obstacle.position[:2] + blended * min_clearance
+                break
+            if not adjusted:
+                break
+
+        if boundary_length is not None:
+            point = np.clip(point, clearance, boundary_length - clearance)
+        return point
+
+    def build_target_slots(self, target, desired_count: int,
+                           escape_direction: Optional[np.ndarray] = None,
+                           obstacles: Optional[List] = None,
+                           boundary_length: Optional[float] = None) -> List[Dict[str, np.ndarray]]:
+        if desired_count <= 0:
+            return []
+        if obstacles is None:
+            obstacles = []
+        base_dir = self._safe_normalize(
+            escape_direction if escape_direction is not None else target.velocity[:2]
+        )
+        if np.linalg.norm(base_dir) <= 1e-6:
+            base_dir = np.array([1.0, 0.0], dtype=float)
+        base_angle = float(np.arctan2(base_dir[1], base_dir[0]))
+        center = np.asarray(target.position[:2], dtype=float)
+        slots = []
+        for slot_index, offset_angle in enumerate(self._build_slot_angles(desired_count)):
+            angle = base_angle + offset_angle
+            raw_position = center + self.slot_radius * np.array(
+                [np.cos(angle), np.sin(angle)],
+                dtype=float,
+            )
+            position = self._project_slot_position(
+                raw_position,
+                center,
+                obstacles,
+                boundary_length=boundary_length,
+            )
+            slots.append({
+                'slot_index': slot_index,
+                'angle': angle,
+                'position': position,
+            })
+        return slots
+
+    def _proximity_score(self, distance: float, scale: float) -> float:
+        safe_scale = max(scale, 1e-6)
+        return float(np.exp(-((distance / safe_scale) ** 2)))
+
+    def _build_assignment_score(
+        self,
+        hunter,
+        target,
+        current_group: List,
+        obstacles: List,
+        slot_meta: Dict[str, np.ndarray],
+        desired_count: int,
+        target_weight: float,
+        previous_assignments: Optional[Dict[int, Dict[str, object]]],
+    ) -> float:
+        density_value = self.compute_utility(
+            hunter,
+            target,
+            current_group,
+            obstacles,
+            w_j=target_weight,
+        )
+        hunter_pos = np.asarray(hunter.position[:2], dtype=float)
+        target_pos = np.asarray(target.position[:2], dtype=float)
+        slot_pos = np.asarray(slot_meta['position'], dtype=float)
+        target_distance = float(np.linalg.norm(target_pos - hunter_pos))
+        slot_distance = float(np.linalg.norm(slot_pos - hunter_pos))
+
+        base_score = (
+            self.density_value_weight * density_value
+            + self.target_proximity_weight * self._proximity_score(target_distance, self.target_distance_scale)
+            + self.slot_proximity_weight * self._proximity_score(slot_distance, self.slot_distance_scale)
+        )
+        score = target_weight * base_score
+        score *= self._coverage_factor(len(current_group), desired_count)
+
+        if previous_assignments:
+            prev_assignment = previous_assignments.get(id(hunter))
+            if prev_assignment:
+                prev_target = prev_assignment.get('target')
+                prev_slot_index = prev_assignment.get('slot_index')
+                if prev_target is target:
+                    score += self.target_inertia_bonus
+                    if prev_slot_index == slot_meta['slot_index']:
+                        score += self.slot_inertia_bonus
+                else:
+                    score -= self.switch_penalty
+
+        return float(score)
+
     def assign_targets(self, hunters: List, targets: List,
-                      obstacles: List, target_weights: Optional[Dict[int, float]] = None) -> Dict[int, object]:
+                      obstacles: List, target_weights: Optional[Dict[int, float]] = None,
+                      previous_assignments: Optional[Dict[int, Dict[str, object]]] = None,
+                      target_escape_directions: Optional[Dict[int, np.ndarray]] = None,
+                      boundary_length: Optional[float] = None,
+                      return_metadata: bool = False) -> Dict[int, object]:
         """
         为所有hunter分配目标，返回 {hunter_id: target} 映射
         
@@ -310,23 +481,44 @@ class DensityFieldAllocator:
             key=lambda target: self._target_weight(target, target_weights),
             reverse=True,
         )
+        target_slots = {
+            target: self.build_target_slots(
+                target,
+                desired_coverages[target_index],
+                None if target_escape_directions is None else target_escape_directions.get(id(target)),
+                obstacles=obstacles,
+                boundary_length=boundary_length,
+            )
+            for target_index, target in enumerate(ordered_targets)
+        }
+        metadata = {}
 
-        # First pass: fill each target towards a balanced coverage level.
+        # First pass: fill each target towards a balanced slot plan.
         for coverage_round in range(max(desired_coverages) if desired_coverages else 0):
             for target_index, target in enumerate(ordered_targets):
                 desired_count = desired_coverages[target_index]
                 current_group = target_groups[target]
                 if len(current_group) >= desired_count or not remaining_hunters:
                     continue
+                slot_plan = target_slots[target]
+                if coverage_round >= len(slot_plan):
+                    continue
+                slot_meta = slot_plan[coverage_round]
 
                 best_hunter = None
                 best_score = -float('inf')
                 target_weight = self._target_weight(target, target_weights)
                 for hunter in remaining_hunters:
-                    utility = self.compute_utility(
-                        hunter, target, current_group, obstacles, w_j=target_weight
+                    score = self._build_assignment_score(
+                        hunter,
+                        target,
+                        current_group,
+                        obstacles,
+                        slot_meta,
+                        desired_count,
+                        target_weight,
+                        previous_assignments,
                     )
-                    score = utility * self._coverage_factor(len(current_group), desired_count)
                     if score > best_score:
                         best_score = score
                         best_hunter = hunter
@@ -335,25 +527,55 @@ class DensityFieldAllocator:
                     assignments[id(best_hunter)] = target
                     target_groups[target].append(best_hunter)
                     remaining_hunters.remove(best_hunter)
+                    metadata[id(best_hunter)] = {
+                        'target': target,
+                        'slot_index': slot_meta['slot_index'],
+                        'slot_position': np.asarray(slot_meta['position'], dtype=float).copy(),
+                        'score': float(best_score),
+                    }
 
         # Second pass: assign any leftovers using utility with overload damping.
         for hunter in remaining_hunters:
             best_target = None
+            best_slot_meta = None
             best_score = -float('inf')
             for target_index, target in enumerate(ordered_targets):
                 current_group = target_groups[target]
                 target_weight = self._target_weight(target, target_weights)
                 desired_count = desired_coverages[target_index]
-                utility = self.compute_utility(
-                    hunter, target, current_group, obstacles, w_j=target_weight
+                slot_plan = target_slots[target]
+                if slot_plan:
+                    slot_meta = slot_plan[min(len(current_group), len(slot_plan) - 1)]
+                else:
+                    slot_meta = {
+                        'slot_index': 0,
+                        'position': np.asarray(target.position[:2], dtype=float).copy(),
+                    }
+                score = self._build_assignment_score(
+                    hunter,
+                    target,
+                    current_group,
+                    obstacles,
+                    slot_meta,
+                    desired_count,
+                    target_weight,
+                    previous_assignments,
                 )
-                score = utility * self._coverage_factor(len(current_group), desired_count)
                 if score > best_score:
                     best_score = score
                     best_target = target
+                    best_slot_meta = slot_meta
 
-            if best_target is not None:
+            if best_target is not None and best_slot_meta is not None:
                 assignments[id(hunter)] = best_target
                 target_groups[best_target].append(hunter)
+                metadata[id(hunter)] = {
+                    'target': best_target,
+                    'slot_index': best_slot_meta['slot_index'],
+                    'slot_position': np.asarray(best_slot_meta['position'], dtype=float).copy(),
+                    'score': float(best_score),
+                }
 
+        if return_metadata:
+            return metadata
         return assignments

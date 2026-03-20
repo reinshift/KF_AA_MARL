@@ -29,6 +29,8 @@ def setup_paper_style():
     rcParams['axes.grid'] = True
     rcParams['grid.alpha'] = 0.3
     rcParams['figure.figsize'] = (8, 5)
+    rcParams['font.sans-serif'] = ['SimSun', 'DejaVu Sans']
+    rcParams['font.family'] = 'sans-serif'
     rcParams['axes.unicode_minus'] = False
 
 setup_paper_style()
@@ -63,9 +65,9 @@ def plot_training_curves(csv_path, save_dir, window=30):
     # 1. Hunter/Target Rewards
     ax = axes[0, 0]
     ax.plot(episodes, df['total_reward_hunters'], alpha=0.2, color='#d62728')
-    ax.plot(episodes, _smooth(df['total_reward_hunters'], window), color='#d62728', label='Hunter Reward')
+    ax.plot(episodes, _smooth(df['total_reward_hunters'], window), color='#d62728', label='追击者奖励')
     ax.plot(episodes, df['total_reward_targets'], alpha=0.2, color='#2ca02c')
-    ax.plot(episodes, _smooth(df['total_reward_targets'], window), color='#2ca02c', label='Target Reward')
+    ax.plot(episodes, _smooth(df['total_reward_targets'], window), color='#2ca02c', label='逃逸者奖励')
     ax.set_xlabel('Episode')
     ax.set_ylabel('Total Reward')
     ax.set_title('Training Rewards')
@@ -89,8 +91,8 @@ def plot_training_curves(csv_path, save_dir, window=30):
         actor = df['avg_actor_loss'].values
         mask = critic > 0  # 跳过无loss的early episodes
         if mask.sum() > 0:
-            ax.plot(episodes[mask], _smooth(critic[mask], window), color='#ff7f0e', label='Critic Loss')
-            ax.plot(episodes[mask], _smooth(np.abs(actor[mask]), window), color='#9467bd', label='|Actor Loss|')
+            ax.plot(episodes[mask], _smooth(critic[mask], window), color='#ff7f0e', label='评论家损失')
+            ax.plot(episodes[mask], _smooth(np.abs(actor[mask]), window), color='#9467bd', label='演员损失绝对值')
             ax.set_yscale('log')
     ax.set_xlabel('Episode')
     ax.set_ylabel('Loss')
@@ -302,10 +304,10 @@ def plot_trajectory(env, save_path, title='Pursuit Trajectory'):
     # Legend
     from matplotlib.lines import Line2D
     legend_elements = [
-        Line2D([0], [0], color='red', linewidth=2, label='Hunter'),
-        Line2D([0], [0], color='green', linewidth=2, label='Target'),
-        Line2D([0], [0], marker='s', color='blue', linestyle='None', markersize=6, label='Start'),
-        Line2D([0], [0], marker='x', color='black', linestyle='None', markersize=8, markeredgewidth=2, label='End'),
+        Line2D([0], [0], color='red', linewidth=2, label='追击者'),
+        Line2D([0], [0], color='green', linewidth=2, label='逃逸者'),
+        Line2D([0], [0], marker='s', color='blue', linestyle='None', markersize=6, label='起点'),
+        Line2D([0], [0], marker='x', color='black', linestyle='None', markersize=8, markeredgewidth=2, label='终点'),
     ]
     ax.legend(handles=legend_elements, loc='upper right')
 
@@ -335,11 +337,11 @@ def generate_all_paper_figures(experiments_dir):
     # 2. 消融实验对比
     ablation_csvs = {}
     exp_names = {
-        'baseline': 'Baseline',
-        'optimized': 'Optimized',
-        'ablation_no_density': 'No Density Field',
-        'ablation_no_role': 'No Role Assign',
-        'ablation_no_refvel': 'No Ref Velocity',
+        'baseline': '基线方法',
+        'optimized': '优化方法',
+        'ablation_no_density': '无密度场',
+        'ablation_no_role': '无角色分配',
+        'ablation_no_refvel': '无引导速度',
     }
     for folder, label in exp_names.items():
         csv_path = os.path.join(experiments_dir, folder, 'rewards.csv')

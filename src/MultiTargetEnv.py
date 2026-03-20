@@ -109,6 +109,12 @@ class MultiTarEnv:
         self.target_hunter_repulsion_scale = 1.0
         self.target_hunter_contact_penalty_coeff = 1.0
         self.assignment_escape_pressure_coeff = 0.0
+        self.assignment_density_value_weight = 1.0
+        self.assignment_target_proximity_weight = 2.6
+        self.assignment_slot_proximity_weight = 1.4
+        self.assignment_switch_penalty = 0.45
+        self.assignment_target_inertia_bonus = 0.35
+        self.assignment_slot_inertia_bonus = 0.20
         self.randomize_layout = True
         self.randomize_exit_zone = False
         self.map_refresh_interval = 20
@@ -128,6 +134,12 @@ class MultiTarEnv:
             delta=1e-6,  # small constant for utility calculation
             underloaded_priority=1.2,
             over_assignment_penalty=0.8,
+            density_value_weight=self.assignment_density_value_weight,
+            target_proximity_weight=self.assignment_target_proximity_weight,
+            slot_proximity_weight=self.assignment_slot_proximity_weight,
+            switch_penalty=self.assignment_switch_penalty,
+            target_inertia_bonus=self.assignment_target_inertia_bonus,
+            slot_inertia_bonus=self.assignment_slot_inertia_bonus,
         )
         
         # Reference velocity calculator for target escape strategy
@@ -221,6 +233,24 @@ class MultiTarEnv:
                 self.density_allocator.underloaded_priority = mechanism_config['density_underloaded_priority']
             if 'density_over_assignment_penalty' in mechanism_config:
                 self.density_allocator.over_assignment_penalty = mechanism_config['density_over_assignment_penalty']
+            if 'assignment_density_value_weight' in mechanism_config:
+                self.assignment_density_value_weight = float(mechanism_config['assignment_density_value_weight'])
+                self.density_allocator.density_value_weight = self.assignment_density_value_weight
+            if 'assignment_target_proximity_weight' in mechanism_config:
+                self.assignment_target_proximity_weight = float(mechanism_config['assignment_target_proximity_weight'])
+                self.density_allocator.target_proximity_weight = self.assignment_target_proximity_weight
+            if 'assignment_slot_proximity_weight' in mechanism_config:
+                self.assignment_slot_proximity_weight = float(mechanism_config['assignment_slot_proximity_weight'])
+                self.density_allocator.slot_proximity_weight = self.assignment_slot_proximity_weight
+            if 'assignment_switch_penalty' in mechanism_config:
+                self.assignment_switch_penalty = float(mechanism_config['assignment_switch_penalty'])
+                self.density_allocator.switch_penalty = self.assignment_switch_penalty
+            if 'assignment_target_inertia_bonus' in mechanism_config:
+                self.assignment_target_inertia_bonus = float(mechanism_config['assignment_target_inertia_bonus'])
+                self.density_allocator.target_inertia_bonus = self.assignment_target_inertia_bonus
+            if 'assignment_slot_inertia_bonus' in mechanism_config:
+                self.assignment_slot_inertia_bonus = float(mechanism_config['assignment_slot_inertia_bonus'])
+                self.density_allocator.slot_inertia_bonus = self.assignment_slot_inertia_bonus
             if 'min_group_size_for_interceptor' in mechanism_config:
                 self.role_assigner.min_group_size_for_interceptor = mechanism_config['min_group_size_for_interceptor']
             if 'max_interceptors_per_target' in mechanism_config:
@@ -626,21 +656,22 @@ class MultiTarEnv:
         forward_offset = float(self.containment_slot_forward_offset)
         lateral_offset = float(self.containment_slot_lateral_offset)
         slot_sigma = max(lateral_offset, 1e-3)
-        slots = [
-            target_pos + forward_offset * escape_dir + lateral_offset * flank_dir,
-            target_pos + forward_offset * escape_dir - lateral_offset * flank_dir,
-        ]
 
         slot_rewards = {}
         signed_side_scores = []
         for hunter in chasers:
             hunter_pos = hunter.position[:2]
-            min_slot_distance = min(np.linalg.norm(slot - hunter_pos) for slot in slots)
+            assigned_slot = getattr(hunter, 'assignment_slot_position', None)
+            if assigned_slot is not None and np.linalg.norm(assigned_slot[:2]) > 1e-9:
+                slot_pos = np.asarray(assigned_slot[:2], dtype=float)
+            else:
+                slot_pos = target_pos + forward_offset * escape_dir
+            min_slot_distance = np.linalg.norm(slot_pos - hunter_pos)
             slot_rewards[id(hunter)] = float(
                 np.exp(-(min_slot_distance ** 2) / max(2.0 * slot_sigma ** 2, 1e-6))
             )
 
-            rel = hunter_pos - target_pos
+            rel = slot_pos - target_pos
             lateral = float(np.dot(rel, flank_dir))
             forward = float(np.dot(rel, escape_dir))
             forward_gate = float(
@@ -766,7 +797,7 @@ class MultiTarEnv:
             )
 
         # Assign initial targets to hunters
-        self._assign_targets_to_hunters()
+        self._assign_targets_to_hunters_v2()
         
         # Assign initial roles to hunters
         self._assign_hunter_roles()
@@ -898,7 +929,7 @@ class MultiTarEnv:
                     )
 
         # Assign targets to hunters using density field allocator
-        self._assign_targets_to_hunters()
+        self._assign_targets_to_hunters_v2()
         
         # Update Kalman filters for all targets
         for target in self.targets:
@@ -953,6 +984,75 @@ class MultiTarEnv:
             else:
                 hunter.assigned_target = None
     
+    def _assign_targets_to_hunters_v2(self):
+        """
+        Assign hunters with capacity-constrained density bids and per-target slots.
+        """
+        active_targets = self._get_active_targets()
+        if not active_targets:
+            assignments = {}
+        elif self.use_density_field:
+            target_weights = self._build_target_assignment_weights(active_targets)
+            previous_assignments = {}
+            for hunter in self.hunters:
+                if hunter.assigned_target is None or not self._is_target_active(hunter.assigned_target):
+                    continue
+                previous_assignments[id(hunter)] = {
+                    'target': hunter.assigned_target,
+                    'slot_index': getattr(hunter, 'assignment_slot_index', None),
+                }
+            target_escape_directions = {
+                id(target): self._get_escape_direction(target) for target in active_targets
+            }
+            assignments = self.density_allocator.assign_targets(
+                self.hunters,
+                active_targets,
+                self.obstacles,
+                target_weights=target_weights,
+                previous_assignments=previous_assignments,
+                target_escape_directions=target_escape_directions,
+                boundary_length=self.length,
+                return_metadata=True,
+            )
+        else:
+            assignments = {}
+            for hunter in self.hunters:
+                nearest = self._get_nearest_target(hunter)
+                if nearest is not None:
+                    assignments[id(hunter)] = {
+                        'target': nearest,
+                        'slot_index': None,
+                        'slot_position': nearest.position[:2].copy(),
+                        'score': 0.0,
+                    }
+
+        for hunter in self.hunters:
+            hunter_id = id(hunter)
+            if hunter_id in assignments:
+                assignment = assignments[hunter_id]
+                hunter.assigned_target = assignment['target']
+                hunter.assignment_slot_index = assignment.get('slot_index')
+                slot_position = assignment.get('slot_position', hunter.assigned_target.position[:2])
+                hunter.assignment_slot_position = np.array([
+                    slot_position[0],
+                    slot_position[1],
+                    hunter.assigned_target.position[2],
+                ], dtype=float)
+            else:
+                hunter.assigned_target = None
+                hunter.assignment_slot_index = None
+                hunter.assignment_slot_position = np.zeros(3, dtype=float)
+
+    def _get_hunter_slot_objective(self, hunter, target):
+        if (
+            getattr(hunter, 'assignment_slot_index', None) is not None
+            and np.linalg.norm(getattr(hunter, 'assignment_slot_position', np.zeros(3))) > 1e-9
+        ):
+            slot_pos = np.asarray(hunter.assignment_slot_position, dtype=float).copy()
+            slot_pos[2] = target.position[2]
+            return slot_pos
+        return target.position.copy()
+
     def _assign_hunter_roles(self):
         """
         为hunter分配角色（chaser或interceptor）
@@ -973,7 +1073,10 @@ class MultiTarEnv:
             for hunter in self.hunters:
                 hunter.role = 'chaser'
                 if hunter.assigned_target is not None:
-                    hunter.target_position = hunter.assigned_target.position.copy()
+                    hunter.target_position = self._get_hunter_slot_objective(
+                        hunter,
+                        hunter.assigned_target,
+                    )
                 else:
                     hunter.target_position = np.zeros(3)
             return
@@ -989,16 +1092,19 @@ class MultiTarEnv:
                 if hunter_id in roles:
                     hunter.role = roles[hunter_id]
                     # 根据角色设置target_position
-                    hunter.target_position = self.role_assigner.get_target_position_for_hunter(
-                        hunter,
-                        target,
-                        hunter.role,
-                        project_fn=self._project_intercept_point,
-                    )
+                    if hunter.role == 'interceptor':
+                        hunter.target_position = self.role_assigner.get_target_position_for_hunter(
+                            hunter,
+                            target,
+                            hunter.role,
+                            project_fn=self._project_intercept_point,
+                        )
+                    else:
+                        hunter.target_position = self._get_hunter_slot_objective(hunter, target)
                 else:
                     # 默认为chaser
                     hunter.role = 'chaser'
-                    hunter.target_position = target.position.copy()
+                    hunter.target_position = self._get_hunter_slot_objective(hunter, target)
         
         # 处理没有分配到target的hunters
         for hunter in self.hunters:
@@ -1639,6 +1745,8 @@ class Hunter(AgentBase):
     def __init__(self, boundary_length, max_distance=0.2, num_rays=16, time_step=0.5, obstacles=None):
         super().__init__(boundary_length, max_distance, num_rays, time_step, obstacles)  # inherit base class
         self.assigned_target = None  # Target assigned by density field allocator
+        self.assignment_slot_index = None
+        self.assignment_slot_position = np.zeros(3)
         self.assigned_group_size = 0
         self.role = 'chaser'  # Role: 'chaser' or 'interceptor'
         self.target_position = np.zeros(3)  # Current target position to pursue (may be predicted position)

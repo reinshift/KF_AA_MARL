@@ -216,6 +216,79 @@ class TestDensityFieldIntegration(unittest.TestCase):
 
         self.assertEqual(sorted(counts), [3, 3])
 
+    def test_assignment_metadata_prefers_close_target_slots(self):
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=0, num_hunters=2,
+            num_targets=2, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        env.targets[0].position[:2] = np.array([0.45, 1.0], dtype=float)
+        env.targets[1].position[:2] = np.array([1.55, 1.0], dtype=float)
+        env.hunters[0].position[:2] = np.array([0.35, 1.0], dtype=float)
+        env.hunters[1].position[:2] = np.array([1.65, 1.0], dtype=float)
+
+        metadata = self.allocator.assign_targets(
+            env.hunters,
+            env.targets,
+            env.obstacles,
+            target_escape_directions={id(target): np.array([1.0, 0.0], dtype=float) for target in env.targets},
+            return_metadata=True,
+        )
+
+        self.assertIs(metadata[id(env.hunters[0])]['target'], env.targets[0])
+        self.assertIs(metadata[id(env.hunters[1])]['target'], env.targets[1])
+
+    def test_assignment_inertia_keeps_previous_target_when_scores_are_close(self):
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=0, num_hunters=1,
+            num_targets=2, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        hunter = env.hunters[0]
+        env.targets[0].position[:2] = np.array([0.95, 1.0], dtype=float)
+        env.targets[1].position[:2] = np.array([1.05, 1.0], dtype=float)
+        hunter.position[:2] = np.array([1.0, 1.0], dtype=float)
+
+        metadata = self.allocator.assign_targets(
+            [hunter],
+            env.targets,
+            env.obstacles,
+            previous_assignments={id(hunter): {'target': env.targets[0], 'slot_index': 0}},
+            target_escape_directions={id(target): np.array([1.0, 0.0], dtype=float) for target in env.targets},
+            return_metadata=True,
+        )
+
+        self.assertIs(metadata[id(hunter)]['target'], env.targets[0])
+
+    def test_assignment_slots_are_projected_clear_of_obstacles(self):
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=1, num_hunters=3,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        target = env.targets[0]
+        obstacle = env.obstacles[0]
+        target.position[:2] = np.array([1.0, 1.0], dtype=float)
+        obstacle.position[:2] = np.array([1.12, 1.0], dtype=float)
+        obstacle.radius = 0.10
+
+        metadata = self.allocator.assign_targets(
+            env.hunters,
+            [target],
+            env.obstacles,
+            target_escape_directions={id(target): np.array([1.0, 0.0], dtype=float)},
+            boundary_length=env.length,
+            return_metadata=True,
+        )
+
+        for assignment in metadata.values():
+            slot_pos = assignment['slot_position']
+            clearance = obstacle.radius + self.allocator.slot_clearance_margin
+            self.assertGreaterEqual(np.linalg.norm(slot_pos - obstacle.position[:2]), clearance - 1e-6)
+
 
 class TestEscapeStrategyIntegration(unittest.TestCase):
     """测试逃逸策略与环境的集成"""
@@ -448,7 +521,7 @@ class TestRoleAssignmentIntegration(unittest.TestCase):
             self.assertIn(hunter.role, ['chaser', 'interceptor'])
             self.assertEqual(len(hunter.target_position), 3)
 
-    def test_chaser_uses_current_position(self):
+    def test_chaser_uses_assigned_slot_position(self):
         """chaser的target_position应为target当前位置"""
         env = MultiTarEnv(
             length=2.0, num_obstacle=2, num_hunters=4,
@@ -465,9 +538,9 @@ class TestRoleAssignmentIntegration(unittest.TestCase):
             if hunter.role == 'chaser' and hunter.assigned_target is not None:
                 np.testing.assert_array_almost_equal(
                     hunter.target_position,
-                    hunter.assigned_target.position,
+                    hunter.assignment_slot_position,
                     decimal=5,
-                    err_msg="Chaser should track target's current position"
+                    err_msg="Chaser should track its assigned slot objective"
                 )
 
     def test_role_assignment_caps_interceptors(self):
@@ -762,6 +835,11 @@ class TestRewardIntegration(unittest.TestCase):
             mechanism_config={
                 'assignment_escape_pressure_coeff': 0.7,
                 'density_underloaded_priority': 1.8,
+                'assignment_target_proximity_weight': 3.1,
+                'assignment_slot_proximity_weight': 1.7,
+                'assignment_switch_penalty': 0.55,
+                'assignment_target_inertia_bonus': 0.45,
+                'assignment_slot_inertia_bonus': 0.25,
                 'max_interceptors_per_target': 0,
                 'map_refresh_interval': 7,
                 'randomize_exit_zone': True,
@@ -780,6 +858,11 @@ class TestRewardIntegration(unittest.TestCase):
         self.assertEqual(env.distance_threshold, 0.025)
         self.assertEqual(env.assignment_escape_pressure_coeff, 0.7)
         self.assertEqual(env.density_allocator.underloaded_priority, 1.8)
+        self.assertEqual(env.density_allocator.target_proximity_weight, 3.1)
+        self.assertEqual(env.density_allocator.slot_proximity_weight, 1.7)
+        self.assertEqual(env.density_allocator.switch_penalty, 0.55)
+        self.assertEqual(env.density_allocator.target_inertia_bonus, 0.45)
+        self.assertEqual(env.density_allocator.slot_inertia_bonus, 0.25)
         self.assertEqual(env.role_assigner.max_interceptors_per_target, 0)
         self.assertEqual(env.map_refresh_interval, 7)
         self.assertTrue(env.randomize_exit_zone)
