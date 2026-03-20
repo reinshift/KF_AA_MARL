@@ -65,7 +65,7 @@ EXPERIMENT_CONFIGS = {
     },
     'curriculum': {
         'description': 'curriculum training with balanced coverage and gated coordination',
-        'num_episodes': 250,
+        'num_episodes': 200,
         'seed': 42,
         'max_steps': 200,
         'save_interval': 50,
@@ -78,12 +78,22 @@ EXPERIMENT_CONFIGS = {
                         'capture_reward': 12.0,
                         'team_capture_bonus': 1.5,
                         'chase_reward_coeff': 1.4,
+                        'blocked_chase_reward_coeff': 0.0,
+                        'stuck_penalty_coeff': 0.0,
                         'escape_reward_coeff': 0.15,
-                        'alignment_reward_coeff': 0.0,
-                        'safe_penalty_coeff': 0.45,
+                        'alignment_reward_coeff': 0.05,
+                        'safe_penalty_coeff': 0.4,
                         'obstacle_interior_penalty': 0.8,
                         'obstacle_proximity_penalty_coeff': 0.7,
                         'hunter_time_penalty_coeff': 0.003,
+                        'full_capture_outcome_reward': 8.0,
+                        'partial_capture_outcome_reward': 0.5,
+                        'timeout_outcome_reward': -0.3,
+                        'escape_outcome_reward': -4.0,
+                        'target_full_capture_outcome_reward': -3.0,
+                        'target_partial_capture_outcome_reward': -0.3,
+                        'target_timeout_outcome_reward': 0.0,
+                        'target_escape_outcome_reward': 4.0,
                         'distance_threshold': 0.018,
                     },
                     'ablation': {
@@ -96,6 +106,13 @@ EXPERIMENT_CONFIGS = {
                         'density_underloaded_priority': 0.8,
                         'density_over_assignment_penalty': 0.4,
                         'max_interceptors_per_target': 0,
+                        'map_refresh_interval': 25,
+                        'randomize_exit_zone': False,
+                    },
+                    'update': {
+                        'hunter_repeats': 5,
+                        'target_repeats': 4,
+                        'target_train_enabled': True,
                     },
                 },
                 {
@@ -105,12 +122,22 @@ EXPERIMENT_CONFIGS = {
                         'capture_reward': 12.0,
                         'team_capture_bonus': 2.5,
                         'chase_reward_coeff': 1.2,
-                        'escape_reward_coeff': 0.22,
-                        'alignment_reward_coeff': 0.0,
-                        'safe_penalty_coeff': 0.35,
+                        'blocked_chase_reward_coeff': 0.25,
+                        'stuck_penalty_coeff': 0.05,
+                        'escape_reward_coeff': 0.18,
+                        'alignment_reward_coeff': 0.1,
+                        'safe_penalty_coeff': 0.3,
                         'obstacle_interior_penalty': 0.7,
                         'obstacle_proximity_penalty_coeff': 0.75,
                         'hunter_time_penalty_coeff': 0.0035,
+                        'full_capture_outcome_reward': 9.0,
+                        'partial_capture_outcome_reward': 1.2,
+                        'timeout_outcome_reward': -0.5,
+                        'escape_outcome_reward': -4.5,
+                        'target_full_capture_outcome_reward': -3.2,
+                        'target_partial_capture_outcome_reward': -0.6,
+                        'target_timeout_outcome_reward': 0.0,
+                        'target_escape_outcome_reward': 4.5,
                         'distance_threshold': 0.016,
                     },
                     'ablation': {
@@ -123,6 +150,13 @@ EXPERIMENT_CONFIGS = {
                         'density_underloaded_priority': 1.6,
                         'density_over_assignment_penalty': 1.2,
                         'max_interceptors_per_target': 0,
+                        'map_refresh_interval': 18,
+                        'randomize_exit_zone': False,
+                    },
+                    'update': {
+                        'hunter_repeats': 5,
+                        'target_repeats': 3,
+                        'target_train_enabled': True,
                     },
                 },
                 {
@@ -131,13 +165,23 @@ EXPERIMENT_CONFIGS = {
                     'reward': {
                         'capture_reward': 14.0,
                         'team_capture_bonus': 3.0,
-                        'chase_reward_coeff': 1.0,
-                        'escape_reward_coeff': 0.30,
-                        'alignment_reward_coeff': 0.25,
+                        'chase_reward_coeff': 1.05,
+                        'blocked_chase_reward_coeff': 0.50,
+                        'stuck_penalty_coeff': 0.10,
+                        'escape_reward_coeff': 0.15,
+                        'alignment_reward_coeff': 0.40,
                         'safe_penalty_coeff': 0.25,
                         'obstacle_interior_penalty': 0.6,
                         'obstacle_proximity_penalty_coeff': 0.85,
                         'hunter_time_penalty_coeff': 0.004,
+                        'full_capture_outcome_reward': 10.0,
+                        'partial_capture_outcome_reward': 1.8,
+                        'timeout_outcome_reward': -0.8,
+                        'escape_outcome_reward': -5.0,
+                        'target_full_capture_outcome_reward': -3.6,
+                        'target_partial_capture_outcome_reward': -0.9,
+                        'target_timeout_outcome_reward': -0.1,
+                        'target_escape_outcome_reward': 5.0,
                         'distance_threshold': 0.014,
                     },
                     'ablation': {
@@ -150,6 +194,13 @@ EXPERIMENT_CONFIGS = {
                         'density_underloaded_priority': 1.8,
                         'density_over_assignment_penalty': 1.4,
                         'max_interceptors_per_target': 0,
+                        'map_refresh_interval': 12,
+                        'randomize_exit_zone': True,
+                    },
+                    'update': {
+                        'hunter_repeats': 5,
+                        'target_repeats': 4,
+                        'target_train_enabled': True,
                     },
                 },
                 {
@@ -158,13 +209,23 @@ EXPERIMENT_CONFIGS = {
                     'reward': {
                         'capture_reward': 16.0,
                         'team_capture_bonus': 4.0,
-                        'chase_reward_coeff': 0.9,
-                        'escape_reward_coeff': 0.35,
-                        'alignment_reward_coeff': 0.20,
+                        'chase_reward_coeff': 1.10,
+                        'blocked_chase_reward_coeff': 0.75,
+                        'stuck_penalty_coeff': 0.15,
+                        'escape_reward_coeff': 0.18,
+                        'alignment_reward_coeff': 0.35,
                         'safe_penalty_coeff': 0.20,
                         'obstacle_interior_penalty': 0.6,
                         'obstacle_proximity_penalty_coeff': 0.90,
                         'hunter_time_penalty_coeff': 0.005,
+                        'full_capture_outcome_reward': 12.0,
+                        'partial_capture_outcome_reward': 2.5,
+                        'timeout_outcome_reward': -1.0,
+                        'escape_outcome_reward': -6.0,
+                        'target_full_capture_outcome_reward': -4.0,
+                        'target_partial_capture_outcome_reward': -1.2,
+                        'target_timeout_outcome_reward': -0.2,
+                        'target_escape_outcome_reward': 6.0,
                         'distance_threshold': 0.012,
                     },
                     'ablation': {
@@ -182,6 +243,13 @@ EXPERIMENT_CONFIGS = {
                         'min_interceptor_distance': 0.14,
                         'max_interceptor_distance': 0.28,
                         'interceptor_prediction_steps': 3,
+                        'map_refresh_interval': 8,
+                        'randomize_exit_zone': True,
+                    },
+                    'update': {
+                        'hunter_repeats': 4,
+                        'target_repeats': 3,
+                        'target_train_enabled': True,
                     },
                 },
             ],
@@ -303,6 +371,15 @@ def run_experiment(exp_name):
     rw = config.get('reward')
     if rw:
         env.configure_training_phase(reward_config=rw)
+    if curriculum:
+        initial_stage = resolve_curriculum_stage(curriculum, 1, config['num_episodes'])
+        if initial_stage:
+            env.configure_training_phase(
+                stage_name=initial_stage.get('name'),
+                reward_config=initial_stage.get('reward'),
+                ablation_config=initial_stage.get('ablation'),
+                mechanism_config=initial_stage.get('mechanism'),
+            )
 
     num_episodes = config['num_episodes']
     max_steps = config.get('max_steps', 150)
@@ -341,9 +418,11 @@ def run_experiment(exp_name):
         with open(csv_path, 'w', newline='') as f:
             w = csv.writer(f)
             w.writerow(["episode", "stage", "steps", "capture_success",
+                         "outcome_code", "captured_target_count", "escaped_target_count",
                          "total_reward_hunters", "total_reward_targets",
                          "avg_chase_reward", "avg_capture_reward",
                          "avg_escape_reward", "avg_alignment_reward",
+                         "avg_gap_reward", "avg_stuck_penalty", "avg_blocked_chase",
                          "avg_critic_loss", "avg_actor_loss",
                          "avg_active_targets", "avg_min_group_size",
                          "avg_max_group_size", "avg_group_size_std",
@@ -378,6 +457,7 @@ def run_experiment(exp_name):
     for episode in tqdm(range(start_episode, num_episodes + 1), desc=f"[{exp_name}]",
                         initial=start_episode - 1, total=num_episodes, ncols=100):
         stage_name = 'default'
+        update_cfg = {'hunter_repeats': 5, 'target_repeats': 5, 'target_train_enabled': True}
         stage = resolve_curriculum_stage(curriculum, episode, num_episodes)
         if stage:
             env.configure_training_phase(
@@ -387,6 +467,7 @@ def run_experiment(exp_name):
                 mechanism_config=stage.get('mechanism'),
             )
             stage_name = stage.get('name', 'default')
+            update_cfg.update(stage.get('update', {}))
 
         h_obs, t_obs = env.reset()
         ep_rh = np.zeros(env.num_hunters)
@@ -394,10 +475,14 @@ def run_experiment(exp_name):
         done = False
         step = 0
         ep_chase, ep_capture, ep_escape, ep_align = [], [], [], []
+        ep_gap, ep_stuck, ep_blocked = [], [], []
         ep_active_targets, ep_min_group, ep_max_group, ep_group_std, ep_interceptors = [], [], [], [], []
         ep_closs, ep_aloss = [], []
         capture = False
         escape = False
+        outcome_code = None
+        captured_target_count = 0
+        escaped_target_count = 0
 
         while not done and step < max_steps:
             ha = [h.select_action(h_obs[i]) for i, h in enumerate(hunters)]
@@ -412,11 +497,20 @@ def run_experiment(exp_name):
             ep_capture.append(np.mean(ri['capture_rewards']))
             ep_escape.append(np.mean(ri['escape_rewards']))
             ep_align.append(np.mean(ri['alignment_rewards']))
+            ep_gap.append(ri.get('avg_gap_reward', 0.0))
+            ep_stuck.append(ri.get('avg_stuck_penalty', 0.0))
+            ep_blocked.append(ri.get('blocked_chase_ratio', 0.0))
             ep_active_targets.append(ri.get('active_target_count', env.num_targets))
             ep_min_group.append(ri.get('min_group_size', 0))
             ep_max_group.append(ri.get('max_group_size', 0))
             ep_group_std.append(ri.get('group_size_std', 0.0))
             ep_interceptors.append(ri.get('interceptor_count', 0))
+
+            timed_out = (step + 1 >= max_steps) and not ri.get('episode_terminal', any(dones))
+            if timed_out:
+                rewards, timeout_info = env.finalize_timeout_outcome(rewards)
+                ri.update(timeout_info)
+                dones = [True] * (env.num_hunters + env.num_targets)
 
             rh = rewards[:env.num_hunters]
             rt = rewards[env.num_hunters:]
@@ -430,17 +524,21 @@ def run_experiment(exp_name):
             ep_rh += rh
             ep_rt += rt
             h_obs, t_obs = h_next, t_next
-            done = ri.get('episode_terminal', any(dones))
+            done = ri.get('episode_terminal', any(dones)) or timed_out
             if ri.get('capture_happened', False):
                 capture = True
             if ri.get('escape_happened', False):
                 escape = True
+            if ri.get('outcome_code') is not None:
+                outcome_code = ri.get('outcome_code')
+            captured_target_count = max(captured_target_count, int(ri.get('captured_target_count', 0)))
+            escaped_target_count = max(escaped_target_count, int(ri.get('escaped_target_count', 0)))
             step += 1
 
             update_counter += 1
             if update_counter % 10 == 0:
                 if h_buffer.size() >= 1024:
-                    for _ in range(5):
+                    for _ in range(update_cfg.get('hunter_repeats', 5)):
                         batch = h_buffer.sample(256)
                         for h in hunters:
                             losses = h.update(batch)
@@ -448,23 +546,32 @@ def run_experiment(exp_name):
                                 ep_closs.append(losses[0])
                                 if losses[1] is not None:
                                     ep_aloss.append(losses[1])
-                if t_buffer.size() >= 1024:
-                    for _ in range(5):
+                if update_cfg.get('target_train_enabled', True) and t_buffer.size() >= 1024:
+                    for _ in range(update_cfg.get('target_repeats', 5)):
                         batch = t_buffer.sample(256)
                         for t in targets:
                             t.update(batch)
 
         total_rh = ep_rh.sum()
         total_rt = ep_rt.sum()
+        if outcome_code is None:
+            outcome_code = env._get_outcome_code(timed_out=(not capture and not escape))
+        outcome_priority = {2: 1000.0, 1: 200.0, 0: 0.0, -1: -200.0}.get(outcome_code, 0.0)
+        model_score = total_rh + outcome_priority
 
         with open(csv_path, 'a', newline='') as f:
             w = csv.writer(f)
             w.writerow([episode, stage_name, step, int(capture),
+                         outcome_code if outcome_code is not None else "",
+                         captured_target_count, escaped_target_count,
                          f"{total_rh:.4f}", f"{total_rt:.4f}",
                          f"{np.mean(ep_chase):.4f}" if ep_chase else "0",
                          f"{np.mean(ep_capture):.4f}" if ep_capture else "0",
                          f"{np.mean(ep_escape):.4f}" if ep_escape else "0",
                          f"{np.mean(ep_align):.4f}" if ep_align else "0",
+                         f"{np.mean(ep_gap):.4f}" if ep_gap else "0",
+                         f"{np.mean(ep_stuck):.4f}" if ep_stuck else "0",
+                         f"{np.mean(ep_blocked):.4f}" if ep_blocked else "0",
                          f"{np.mean(ep_closs):.6f}" if ep_closs else "0",
                          f"{np.mean(ep_aloss):.6f}" if ep_aloss else "0",
                          f"{np.mean(ep_active_targets):.4f}" if ep_active_targets else "0",
@@ -473,8 +580,15 @@ def run_experiment(exp_name):
                          f"{np.mean(ep_group_std):.4f}" if ep_group_std else "0",
                          f"{np.mean(ep_interceptors):.4f}" if ep_interceptors else "0"])
 
-        cap_str = " CAPTURED" if capture else (" ESCAPED" if escape else "")
-        if episode % 50 == 0 or capture or escape:
+        if outcome_code == 2:
+            cap_str = " ALL_CAPTURED"
+        elif outcome_code == 1:
+            cap_str = " PARTIAL_TIMEOUT"
+        elif outcome_code == -1:
+            cap_str = " ESCAPED"
+        else:
+            cap_str = ""
+        if episode % 50 == 0 or capture or escape or outcome_code == 1:
             tqdm.write(f"  Ep {episode}/{num_episodes}  stage={stage_name}  steps={step}  "
                   f"H={total_rh:.1f}  T={total_rt:.1f}{cap_str}")
 
@@ -488,8 +602,8 @@ def run_experiment(exp_name):
                 t.save_model(ckpt_dir, i, 'target')
 
         # 保存最佳
-        if total_rh > best_score:
-            best_score = total_rh
+        if model_score > best_score:
+            best_score = model_score
             best_dir = os.path.join(models_dir, 'best')
             os.makedirs(best_dir, exist_ok=True)
             for i, h in enumerate(hunters):

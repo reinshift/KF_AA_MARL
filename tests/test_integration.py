@@ -288,7 +288,8 @@ class TestEscapeStrategyIntegration(unittest.TestCase):
             laser_data, laser_angles, exit_dir, max_range=0.20
         )
 
-        self.assertLess(gate, 0.5)
+        self.assertLess(gate, 0.7)
+        self.assertGreater(gate, 0.2)
         self.assertLess(projected_vec[0], 0.5)
         self.assertGreater(abs(projected_vec[1]), 0.5)
 
@@ -305,6 +306,66 @@ class TestEscapeStrategyIntegration(unittest.TestCase):
             v_ref = self.calculator.compute_reference_velocity(target, env.hunters)
             self.assertEqual(len(v_ref), 2)
             self.assertFalse(np.any(np.isnan(v_ref)))
+
+    def test_reference_velocity_without_hunters_is_deterministic(self):
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=0, num_hunters=1,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        target = env.targets[0]
+        target.position[:2] = np.array([1.5, 1.5], dtype=float)
+        target.velocity[:2] = np.zeros(2, dtype=float)
+        target.lasers = np.full(env.num_lasers, env.L_sensor, dtype=float)
+
+        exit_center = np.array([0.15, 0.15], dtype=float)
+        v_ref_1 = self.calculator.compute_reference_velocity(target, [], escape_zone_center=exit_center)
+        v_ref_2 = self.calculator.compute_reference_velocity(target, [], escape_zone_center=exit_center)
+
+        np.testing.assert_allclose(v_ref_1, v_ref_2, atol=1e-9)
+        self.assertLess(np.dot(v_ref_1, target.position[:2] - exit_center), 0.0)
+
+    def test_reference_velocity_blends_inertia_and_exit_guidance(self):
+        target = SimpleNamespace(
+            position=np.array([1.0, 1.0, 0.1], dtype=float),
+            velocity=np.array([0.05, 0.0, 0.0], dtype=float),
+            lasers=np.full(8, 0.20, dtype=float),
+            lidar=SimpleNamespace(
+                angles=np.linspace(0.0, 2 * np.pi, 8, endpoint=False),
+                max_detect_d=0.20,
+            ),
+        )
+
+        v_ref = self.calculator.compute_reference_velocity(
+            target,
+            [],
+            escape_zone_center=np.array([1.0, 1.8], dtype=float),
+        )
+
+        self.assertGreater(v_ref[0], 0.05)
+        self.assertGreater(v_ref[1], 0.05)
+        self.assertAlmostEqual(np.linalg.norm(v_ref), 1.0, places=6)
+
+    def test_reference_velocity_projects_blocked_direction_to_gap(self):
+        target = SimpleNamespace(
+            position=np.array([1.0, 1.0, 0.1], dtype=float),
+            velocity=np.array([0.04, 0.0, 0.0], dtype=float),
+            lasers=np.array([0.03, 0.20, 0.20, 0.20], dtype=float),
+            lidar=SimpleNamespace(
+                angles=np.array([0.0, np.pi / 2, np.pi, 3 * np.pi / 2], dtype=float),
+                max_detect_d=0.20,
+            ),
+        )
+
+        v_ref = self.calculator.compute_reference_velocity(
+            target,
+            [],
+            escape_zone_center=np.array([1.8, 1.0], dtype=float),
+        )
+
+        self.assertLess(v_ref[0], 0.85)
+        self.assertGreater(abs(v_ref[1]), 0.25)
 
 
 class TestRoleAssignmentIntegration(unittest.TestCase):
@@ -556,6 +617,7 @@ class TestRewardIntegration(unittest.TestCase):
             reward_config={
                 'capture_reward': 15.0,
                 'chase_reward_coeff': 0.4,
+                'blocked_chase_reward_coeff': 0.2,
                 'team_capture_bonus': 1.5,
                 'distance_threshold': 0.025,
             },
@@ -568,20 +630,84 @@ class TestRewardIntegration(unittest.TestCase):
                 'assignment_escape_pressure_coeff': 0.7,
                 'density_underloaded_priority': 1.8,
                 'max_interceptors_per_target': 0,
+                'map_refresh_interval': 7,
+                'randomize_exit_zone': True,
             },
         )
 
         self.assertEqual(env.current_stage_name, 'pursuit_only')
         self.assertEqual(env.capture_reward, 15.0)
         self.assertEqual(env.chase_reward_coeff, 0.4)
+        self.assertEqual(env.blocked_chase_reward_coeff, 0.2)
         self.assertEqual(env.team_capture_bonus, 1.5)
         self.assertEqual(env.distance_threshold, 0.025)
         self.assertEqual(env.assignment_escape_pressure_coeff, 0.7)
         self.assertEqual(env.density_allocator.underloaded_priority, 1.8)
         self.assertEqual(env.role_assigner.max_interceptors_per_target, 0)
+        self.assertEqual(env.map_refresh_interval, 7)
+        self.assertTrue(env.randomize_exit_zone)
         self.assertFalse(env.use_density_field)
         self.assertFalse(env.use_role_assignment)
         self.assertFalse(env.use_ref_velocity)
+
+    def test_blocked_chase_terms_reward_gap_following(self):
+        """When direct pursuit is blocked, moving toward a nearby clear gap should be rewarded."""
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=1, num_hunters=4,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        hunter = env.hunters[0]
+        target = env.targets[0]
+
+        hunter.position[:2] = np.array([0.5, 0.5], dtype=float)
+        target.position[:2] = np.array([0.8, 0.5], dtype=float)
+        hunter.velocity[:2] = np.array([0.0, 0.04], dtype=float)
+        hunter.lidar.angles = np.array([0.0, np.pi / 2, np.pi, 3 * np.pi / 2], dtype=float)
+        hunter.lasers = np.array([0.03, env.L_sensor, env.L_sensor, env.L_sensor], dtype=float)
+
+        blocked_ratio, gap_reward, stuck_penalty = env._compute_hunter_blocked_chase_terms(
+            hunter, target, progress=0.01
+        )
+
+        self.assertGreater(blocked_ratio, 0.0)
+        self.assertGreater(gap_reward, 0.0)
+        self.assertGreaterEqual(stuck_penalty, 0.0)
+
+    def test_timeout_outcome_recognizes_partial_capture(self):
+        """Timing out after capturing only part of the targets should produce outcome_code=1."""
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=1, num_hunters=4,
+            num_targets=2, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        env._set_target_state(env.targets[0], 'captured')
+        rewards = [0.0] * (env.num_hunters + env.num_targets)
+
+        rewards, timeout_info = env.finalize_timeout_outcome(rewards)
+
+        self.assertEqual(timeout_info['outcome_code'], 1)
+        self.assertEqual(timeout_info['captured_target_count'], 1)
+        self.assertTrue(any(r > 0 for r in rewards[:env.num_hunters]))
+
+    def test_refreshed_layout_keeps_exit_clear_of_obstacles(self):
+        """Randomized layouts should keep exit zone clear of obstacles."""
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=5, num_hunters=4,
+            num_targets=2, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.randomize_exit_zone = True
+        env._refresh_layout()
+
+        for obstacle in env.obstacles:
+            dist = np.linalg.norm(obstacle.position[:2] - env.escape_zone_center)
+            self.assertGreaterEqual(
+                dist,
+                obstacle.radius + env.escape_zone_radius,
+            )
 
     def test_escape_sector_reward_prefers_motion_inside_clear_sector(self):
         """Target should receive higher reward when moving inside the clear sector."""
@@ -644,6 +770,65 @@ class TestRewardIntegration(unittest.TestCase):
             rewards_blocked, _, _ = env._compute_rewards()
 
         self.assertLess(rewards_blocked[target_index], rewards_open[target_index])
+
+    def test_alignment_reward_uses_cached_reference_velocity(self):
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=0, num_hunters=4,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        target = env.targets[0]
+        target_index = env.num_hunters
+
+        env.escape_reward_coeff = 0.0
+        env.alignment_reward_coeff = 1.0
+        env.safe_penalty_coeff = 0.0
+        env.obstacle_interior_penalty = 0.0
+        env.obstacle_proximity_penalty_coeff = 0.0
+        env._target_boundary_clipped[id(target)] = False
+        env._prev_target_ref_velocities[id(target)] = np.array([1.0, 0.0], dtype=float)
+        target.reference_velocity = np.array([-1.0, 0.0], dtype=float)
+        target.velocity[:2] = np.array([0.05, 0.0], dtype=float)
+        target.position[:2] = np.array([1.0, 1.0], dtype=float)
+        target.lasers = np.full(env.num_lasers, env.L_sensor, dtype=float)
+
+        with patch('utils.isRounded', return_value=False):
+            rewards, _, _ = env._compute_rewards()
+
+        self.assertGreater(rewards[target_index], 0.0)
+
+    def test_alignment_penalty_is_damped_near_boundary(self):
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=0, num_hunters=4,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        target = env.targets[0]
+        target_index = env.num_hunters
+
+        env.escape_reward_coeff = 0.0
+        env.alignment_reward_coeff = 1.0
+        env.safe_penalty_coeff = 0.0
+        env.obstacle_interior_penalty = 0.0
+        env.obstacle_proximity_penalty_coeff = 0.0
+        env._prev_target_ref_velocities[id(target)] = np.array([1.0, 0.0], dtype=float)
+        target.reference_velocity = np.array([1.0, 0.0], dtype=float)
+        target.velocity[:2] = np.array([-0.05, 0.0], dtype=float)
+        target.lasers = np.full(env.num_lasers, env.L_sensor, dtype=float)
+
+        target.position[:2] = np.array([1.0, 1.0], dtype=float)
+        env._target_boundary_clipped[id(target)] = False
+        with patch('utils.isRounded', return_value=False):
+            rewards_center, _, _ = env._compute_rewards()
+
+        target.position[:2] = np.array([0.01, 1.0], dtype=float)
+        env._target_boundary_clipped[id(target)] = True
+        with patch('utils.isRounded', return_value=False):
+            rewards_wall, _, _ = env._compute_rewards()
+
+        self.assertGreater(rewards_wall[target_index], rewards_center[target_index])
 
 
 class TestValidationConfigParsing(unittest.TestCase):

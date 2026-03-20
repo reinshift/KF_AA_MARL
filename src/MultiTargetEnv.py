@@ -48,6 +48,10 @@ class MultiTarEnv:
         self.escape_distance = 0.05 # escape distance threshold for target
         self.distance_threshold = 0.01 # distance threshold for collision
         self.max_escape_angle = 30 # max escape angle for target (degree)
+        self.hunter_spawn_low = 0.50
+        self.hunter_spawn_high = 0.75
+        self.target_spawn_low = 1.50
+        self.target_spawn_high = 1.75
 
         # 逃逸区域：固定在左下角，target需到达此区域才算逃逸成功
         self.escape_zone_center = np.array([0.15, 0.15])
@@ -78,12 +82,28 @@ class MultiTarEnv:
         self.safe_penalty_coeff = 0.15   # safe penalty coeff (降低，避免惩罚主导)
         self.team_capture_bonus = 0.0
         self.hunter_time_penalty_coeff = 0.0
+        self.blocked_chase_reward_coeff = 0.0
+        self.stuck_penalty_coeff = 0.0
+        self.full_capture_outcome_reward = 10.0
+        self.partial_capture_outcome_reward = 3.0
+        self.timeout_outcome_reward = -1.0
+        self.escape_outcome_reward = -6.0
+        self.target_full_capture_outcome_reward = -4.0
+        self.target_partial_capture_outcome_reward = -1.5
+        self.target_timeout_outcome_reward = 0.5
+        self.target_escape_outcome_reward = 6.0
 
         # Target reference velocity reward coefficients
         self.alignment_reward_coeff = 0.5  # cosine similarity reward coefficient
         self.obstacle_interior_penalty = 0.3  # penalty for being inside obstacle (降低)
         self.obstacle_proximity_penalty_coeff = 0.6
         self.assignment_escape_pressure_coeff = 0.0
+        self.randomize_layout = True
+        self.randomize_exit_zone = False
+        self.map_refresh_interval = 20
+        self.layout_clearance_margin = 0.08
+        self.spawn_clearance_margin = 0.12
+        self.exit_clearance_margin = 0.10
 
         # Density field allocator for target assignment
         self.density_allocator = DensityFieldAllocator(
@@ -123,7 +143,10 @@ class MultiTarEnv:
         self.chase_progress_clip = 2.0 * self.v_max * self.time_step
         self._prev_hunter_positions = {}
         self._prev_target_positions = {}
+        self._prev_target_ref_velocities = {}
+        self._target_boundary_clipped = {}
         self.target_states = {}
+        self._reset_count = 0
 
     def configure_training_phase(self, stage_name=None, reward_config=None, ablation_config=None,
                                  mechanism_config=None):
@@ -144,7 +167,17 @@ class MultiTarEnv:
                 'obstacle_proximity_penalty_coeff',
                 'team_capture_bonus',
                 'hunter_time_penalty_coeff',
+                'blocked_chase_reward_coeff',
+                'stuck_penalty_coeff',
                 'distance_threshold',
+                'full_capture_outcome_reward',
+                'partial_capture_outcome_reward',
+                'timeout_outcome_reward',
+                'escape_outcome_reward',
+                'target_full_capture_outcome_reward',
+                'target_partial_capture_outcome_reward',
+                'target_timeout_outcome_reward',
+                'target_escape_outcome_reward',
             ):
                 if attr in reward_config:
                     setattr(self, attr, reward_config[attr])
@@ -176,6 +209,12 @@ class MultiTarEnv:
                 self.role_assigner.max_interceptor_distance = mechanism_config['max_interceptor_distance']
             if 'interceptor_prediction_steps' in mechanism_config:
                 self.role_assigner.prediction_steps = mechanism_config['interceptor_prediction_steps']
+            if 'map_refresh_interval' in mechanism_config:
+                self.map_refresh_interval = max(1, int(mechanism_config['map_refresh_interval']))
+            if 'randomize_exit_zone' in mechanism_config:
+                self.randomize_exit_zone = bool(mechanism_config['randomize_exit_zone'])
+            if 'randomize_layout' in mechanism_config:
+                self.randomize_layout = bool(mechanism_config['randomize_layout'])
     
     def _collect_obs_info(self):
         multi_obs_info = []
@@ -192,6 +231,163 @@ class MultiTarEnv:
             escape_urgency = max(0.0, 1.0 - dist_to_exit / max(diag, 1e-6))
             weights[id(target)] = 1.0 + self.assignment_escape_pressure_coeff * escape_urgency
         return weights
+
+    @staticmethod
+    def _wrap_to_pi(angle):
+        return (angle + np.pi) % (2 * np.pi) - np.pi
+
+    @staticmethod
+    def _point_to_rect_distance(point, rect_bounds):
+        x_min, x_max, y_min, y_max = rect_bounds
+        dx = max(x_min - point[0], 0.0, point[0] - x_max)
+        dy = max(y_min - point[1], 0.0, point[1] - y_max)
+        return float(np.hypot(dx, dy))
+
+    def _get_hunter_spawn_bounds(self):
+        margin = self.spawn_clearance_margin
+        return (
+            max(0.0, self.hunter_spawn_low - margin),
+            min(self.length, self.hunter_spawn_high + margin),
+            max(0.0, self.hunter_spawn_low - margin),
+            min(self.length, self.hunter_spawn_high + margin),
+        )
+
+    def _get_target_spawn_bounds(self):
+        margin = self.spawn_clearance_margin
+        return (
+            max(0.0, self.target_spawn_low - margin),
+            min(self.length, self.target_spawn_high + margin),
+            max(0.0, self.target_spawn_low - margin),
+            min(self.length, self.target_spawn_high + margin),
+        )
+
+    def _sample_exit_zone_center(self):
+        margin = 0.15
+        half = 0.5 * self.length
+        candidates = [
+            np.array([margin, margin], dtype=float),
+            np.array([margin, self.length - margin], dtype=float),
+            np.array([self.length - margin, margin], dtype=float),
+            np.array([self.length - margin, self.length - margin], dtype=float),
+            np.array([margin, half], dtype=float),
+            np.array([self.length - margin, half], dtype=float),
+            np.array([half, margin], dtype=float),
+            np.array([half, self.length - margin], dtype=float),
+        ]
+        for idx in np.random.permutation(len(candidates)):
+            candidate = candidates[idx]
+            if self._point_to_rect_distance(candidate, self._get_hunter_spawn_bounds()) < self.escape_zone_radius:
+                continue
+            if self._point_to_rect_distance(candidate, self._get_target_spawn_bounds()) < self.escape_zone_radius:
+                continue
+            return candidate
+        return candidates[0]
+
+    def _is_obstacle_layout_valid(self, position_xy, radius, placed_obstacles, exit_center):
+        for placed in placed_obstacles:
+            distance = np.linalg.norm(position_xy - placed.position[:2])
+            if distance < radius + placed.radius + self.layout_clearance_margin:
+                return False
+
+        if self._point_to_rect_distance(position_xy, self._get_hunter_spawn_bounds()) < radius:
+            return False
+        if self._point_to_rect_distance(position_xy, self._get_target_spawn_bounds()) < radius:
+            return False
+        if np.linalg.norm(position_xy - exit_center) < radius + self.escape_zone_radius + self.exit_clearance_margin:
+            return False
+        return True
+
+    def _refresh_layout(self):
+        if self.randomize_exit_zone:
+            self.escape_zone_center = self._sample_exit_zone_center()
+
+        placed_obstacles = []
+        for obstacle in self.obstacles:
+            placed = False
+            for _ in range(200):
+                candidate_pos = np.random.uniform(low=0.35, high=self.length - 0.35, size=(3,))
+                candidate_pos[-1] = 0.0
+                candidate_radius = np.random.uniform(0.1, 0.15)
+                candidate_height = np.random.uniform(0.1, 0.15)
+                if self._is_obstacle_layout_valid(candidate_pos[:2], candidate_radius, placed_obstacles, self.escape_zone_center):
+                    obstacle.position = candidate_pos
+                    obstacle.radius = candidate_radius
+                    obstacle.height = candidate_height
+                    placed_obstacles.append(obstacle)
+                    placed = True
+                    break
+            if not placed:
+                obstacle.position = np.array([0.3 + 0.2 * len(placed_obstacles), 1.0, 0.0], dtype=float)
+                obstacle.radius = 0.1
+                obstacle.height = 0.12
+                placed_obstacles.append(obstacle)
+
+        for agent in self.hunters + self.targets:
+            agent.lidar.obstacles = self.obstacles
+
+    def _count_targets_in_state(self, state):
+        return sum(1 for target in self.targets if self._get_target_state(target) == state)
+
+    def _get_outcome_code(self, timed_out=False):
+        all_targets_captured = all(
+            self._get_target_state(target) == 'captured' for target in self.targets
+        )
+        any_target_escaped = any(
+            self._get_target_state(target) == 'escaped' for target in self.targets
+        )
+        captured_target_count = self._count_targets_in_state('captured')
+
+        if all_targets_captured:
+            return 2
+        if any_target_escaped:
+            return -1
+        if timed_out:
+            return 1 if captured_target_count > 0 else 0
+        return None
+
+    def _apply_outcome_bonus(self, rewards, outcome_code):
+        if outcome_code is None:
+            return 0.0, 0.0
+
+        captured_ratio = self._count_targets_in_state('captured') / max(float(self.num_targets), 1.0)
+        hunter_bonus = 0.0
+        target_bonus = 0.0
+        if outcome_code == 2:
+            hunter_bonus = self.full_capture_outcome_reward
+            target_bonus = self.target_full_capture_outcome_reward
+        elif outcome_code == 1:
+            hunter_bonus = self.partial_capture_outcome_reward * captured_ratio
+            target_bonus = self.target_partial_capture_outcome_reward * captured_ratio
+        elif outcome_code == 0:
+            hunter_bonus = self.timeout_outcome_reward
+            target_bonus = self.target_timeout_outcome_reward
+        elif outcome_code == -1:
+            hunter_bonus = self.escape_outcome_reward
+            target_bonus = self.target_escape_outcome_reward
+
+        if abs(hunter_bonus) > 1e-12:
+            for i in range(self.num_hunters):
+                rewards[i] += hunter_bonus
+        if abs(target_bonus) > 1e-12:
+            for i in range(self.num_targets):
+                rewards[self.num_hunters + i] += target_bonus
+
+        return hunter_bonus, target_bonus
+
+    def finalize_timeout_outcome(self, rewards):
+        outcome_code = self._get_outcome_code(timed_out=True)
+        hunter_bonus, target_bonus = self._apply_outcome_bonus(rewards, outcome_code)
+        return rewards, {
+            'outcome_code': outcome_code,
+            'captured_target_count': self._count_targets_in_state('captured'),
+            'escaped_target_count': self._count_targets_in_state('escaped'),
+            'all_targets_captured': outcome_code == 2,
+            'episode_terminal': True,
+            'capture_happened': outcome_code == 2,
+            'escape_happened': outcome_code == -1,
+            'outcome_hunter_bonus': hunter_bonus,
+            'outcome_target_bonus': target_bonus,
+        }
 
     def _compute_hunter_chase_reward(self, hunter, target):
         """
@@ -226,6 +422,71 @@ class MultiTarEnv:
         chase_reward = float(progress * heading_factor)
         return chase_reward, float(progress), cosine_heading
 
+    def _compute_hunter_blocked_chase_terms(self, hunter, target, progress):
+        if len(hunter.lasers) == 0:
+            return 0.0, 0.0, 0.0
+
+        target_vector = target.position[:2] - hunter.position[:2]
+        target_distance = np.linalg.norm(target_vector)
+        if target_distance <= 1e-6:
+            return 0.0, 0.0, 0.0
+
+        max_range = max(float(hunter.lidar.max_detect_d), 1e-6)
+        laser_angles = np.asarray(hunter.lidar.angles, dtype=float)
+        laser_distances = np.asarray(hunter.lasers, dtype=float)
+        target_angle = float(np.arctan2(target_vector[1], target_vector[0]))
+        angle_diffs = np.array([self._wrap_to_pi(angle - target_angle) for angle in laser_angles], dtype=float)
+        direct_idx = int(np.argmin(np.abs(angle_diffs)))
+        direct_clearance = float(np.clip(laser_distances[direct_idx], 0.0, max_range))
+        visibility_limit = min(target_distance, max_range)
+        blocked_ratio = float(np.clip((visibility_limit - direct_clearance) / max(visibility_limit, 1e-6), 0.0, 1.0))
+
+        if blocked_ratio <= 1e-6:
+            return 0.0, 0.0, 0.0
+
+        open_threshold = 0.72 * max_range
+        feasible_mask = laser_distances >= open_threshold
+        if np.any(feasible_mask):
+            feasible_indices = np.where(feasible_mask)[0]
+            best_idx = int(feasible_indices[np.argmin(np.abs(angle_diffs[feasible_indices]))])
+        else:
+            score = laser_distances / max_range - 0.12 * np.abs(angle_diffs) / np.pi
+            best_idx = int(np.argmax(score))
+
+        gap_angle = float(laser_angles[best_idx])
+        gap_direction = np.array([np.cos(gap_angle), np.sin(gap_angle)], dtype=float)
+        gap_clearance = float(np.clip(laser_distances[best_idx] / max_range, 0.0, 1.0))
+
+        hunter_velocity = hunter.velocity[:2]
+        velocity_norm = np.linalg.norm(hunter_velocity)
+        if velocity_norm > 1e-6:
+            gap_alignment = float(np.dot(hunter_velocity, gap_direction) / velocity_norm)
+        else:
+            gap_alignment = 0.0
+
+        progress_ratio = float(np.clip(progress / max(self.chase_progress_clip, 1e-6), -1.0, 1.0))
+        gap_reward = blocked_ratio * gap_clearance * max(gap_alignment, 0.0) * (0.5 + 0.5 * max(progress_ratio, 0.0))
+
+        speed_ratio = float(np.clip(velocity_norm / max(self.v_max, 1e-6), 0.0, 1.0))
+        stalled_ratio = max(0.0, 0.35 - speed_ratio) / 0.35
+        lack_of_progress = 1.0 - max(progress_ratio, 0.0)
+        stuck_penalty = blocked_ratio * stalled_ratio * lack_of_progress
+
+        return blocked_ratio, gap_reward, stuck_penalty
+
+    def _compute_target_alignment_gate(self, target):
+        wall_threshold = 0.6 * self.L_sensor
+        min_wall_distance = min(
+            target.position[0],
+            target.position[1],
+            self.length - target.position[0],
+            self.length - target.position[1],
+        )
+        wall_gate = float(np.clip(min_wall_distance / max(wall_threshold, 1e-6), 0.0, 1.0))
+        if self._target_boundary_clipped.get(id(target), False):
+            wall_gate *= 0.2
+        return wall_gate
+
     def _set_target_state(self, target, state):
         self.target_states[id(target)] = state
 
@@ -245,6 +506,12 @@ class MultiTarEnv:
             h_obs (list of np.array): Observations for all hunters.
             t_obs (list of np.array): Observations for all targets.
         '''
+        if self.randomize_layout:
+            refresh_interval = max(1, int(self.map_refresh_interval))
+            if self._reset_count == 0 or self._reset_count % refresh_interval == 0:
+                self._refresh_layout()
+        self._reset_count += 1
+
         # Helper function to check if position is inside any obstacle
         def is_position_valid(position, obstacles, min_clearance=0.2):
             for obstacle in obstacles:
@@ -258,7 +525,7 @@ class MultiTarEnv:
         for hunter in self.hunters:
             max_attempts = 100
             for attempt in range(max_attempts):
-                hunter.position = np.random.uniform(low=0.50, high=0.75, size=(3,))
+                hunter.position = np.random.uniform(low=self.hunter_spawn_low, high=self.hunter_spawn_high, size=(3,))
                 hunter.position[-1] = 0.10  # initial height
                 if is_position_valid(hunter.position, self.obstacles):
                     break
@@ -274,7 +541,7 @@ class MultiTarEnv:
         for target in self.targets:
             max_attempts = 100
             for attempt in range(max_attempts):
-                target.position = np.random.uniform(low=1.50, high=1.75, size=(3,))
+                target.position = np.random.uniform(low=self.target_spawn_low, high=self.target_spawn_high, size=(3,))
                 target.position[-1] = 0.10  # initial height
                 if is_position_valid(target.position, self.obstacles):
                     break
@@ -302,11 +569,27 @@ class MultiTarEnv:
         # Assign initial roles to hunters
         self._assign_hunter_roles()
 
+        for target in self.targets:
+            if not self._is_target_active(target):
+                target.reference_velocity = np.zeros(2)
+            elif self.use_ref_velocity:
+                target.reference_velocity = self.ref_velocity_calculator.compute_reference_velocity(
+                    target, self.hunters, escape_zone_center=self.escape_zone_center
+                )
+            else:
+                target.reference_velocity = np.zeros(2)
+
         self._prev_hunter_positions = {
             id(hunter): hunter.position[:2].copy() for hunter in self.hunters
         }
         self._prev_target_positions = {
             id(target): target.position[:2].copy() for target in self.targets
+        }
+        self._prev_target_ref_velocities = {
+            id(target): target.reference_velocity.copy() for target in self.targets
+        }
+        self._target_boundary_clipped = {
+            id(target): False for target in self.targets
         }
 
         # Get initial observations
@@ -331,6 +614,12 @@ class MultiTarEnv:
         self._prev_target_positions = {
             id(target): target.position[:2].copy() for target in self.targets
         }
+        self._prev_target_ref_velocities = {
+            id(target): target.reference_velocity.copy() for target in self.targets
+        }
+        self._target_boundary_clipped = {
+            id(target): False for target in self.targets
+        }
 
         # Apply actions to hunters
         for i, hunter in enumerate(self.hunters):
@@ -342,6 +631,16 @@ class MultiTarEnv:
                 target.move(actions[self.num_hunters + i], self.v_max) # Assume "action" set is combination of hunetrs' & targets'
             else:
                 target.velocity = np.zeros(3)
+
+        # Clip to boundaries before scanning so the new reference velocity matches
+        # the actual post-transition state seen in next observations.
+        for hunter in self.hunters:
+            hunter.position[:2] = np.clip(hunter.position[:2], 0, self.length)
+        for target in self.targets:
+            unclipped = target.position[:2].copy()
+            clipped = np.clip(unclipped, 0, self.length)
+            self._target_boundary_clipped[id(target)] = bool(np.any(np.abs(unclipped - clipped) > 1e-9))
+            target.position[:2] = clipped
 
         # Update lasers after movement
         for hunter in self.hunters:
@@ -371,11 +670,6 @@ class MultiTarEnv:
                 else:
                     v_ref = v_random
                 target.reference_velocity = v_ref
-
-        # Optionally: Boundary blocking (when train agents, 
-        # to allow agents traverse the boundary may get worse performance)
-        for agent in self.hunters + self.targets:
-            agent.position[:2] = np.clip(agent.position[:2], 0, self.length)
 
         # Assign targets to hunters using density field allocator
         self._assign_targets_to_hunters()
@@ -684,6 +978,9 @@ class MultiTarEnv:
         capture_rewards = [0.0] * self.num_hunters
         escape_rewards = [0.0] * self.num_targets
         alignment_rewards = [0.0] * self.num_targets
+        gap_progress_rewards = [0.0] * self.num_hunters
+        stuck_penalties = [0.0] * self.num_hunters
+        blocked_chase_ratios = []
 
         # Pre-compute index mappings to avoid repeated .index() calls
         hunter_index_map = {id(h): i for i, h in enumerate(self.hunters)}
@@ -732,10 +1029,18 @@ class MultiTarEnv:
         for target, hunters in target_hunter_groups.items():
             # calculate chasing reward and ifrounded reward
             for hunter in hunters:
-                chase_reward, _, _ = self._compute_hunter_chase_reward(hunter, target)
+                chase_reward, progress, _ = self._compute_hunter_chase_reward(hunter, target)
+                blocked_ratio, gap_reward, stuck_penalty = self._compute_hunter_blocked_chase_terms(
+                    hunter, target, progress
+                )
                 hunter_index = hunter_index_map[id(hunter)]
                 rewards[hunter_index] += self.chase_reward_coeff * chase_reward
                 chase_rewards[hunter_index] += self.chase_reward_coeff * chase_reward
+                rewards[hunter_index] += self.blocked_chase_reward_coeff * gap_reward
+                gap_progress_rewards[hunter_index] += self.blocked_chase_reward_coeff * gap_reward
+                rewards[hunter_index] -= self.stuck_penalty_coeff * stuck_penalty
+                stuck_penalties[hunter_index] += self.stuck_penalty_coeff * stuck_penalty
+                blocked_chase_ratios.append(blocked_ratio)
 
             multi_hunters_pos = [h.position for h in hunters]
             if utils.isRounded(tuple(target.position[:2]), [tuple(row[:2]) for row in multi_hunters_pos], self.L_sensor, self.max_escape_angle,
@@ -766,10 +1071,11 @@ class MultiTarEnv:
             # Add reference velocity alignment reward
             # Use target.reference_velocity already computed in step() — avoid recomputation
             if self.use_ref_velocity:
-                v_ref = target.reference_velocity
+                v_ref = self._prev_target_ref_velocities.get(id(target), target.reference_velocity)
             else:
                 v_ref = np.zeros(2)
             v_actual = target.velocity[:2]
+            alignment_gate = self._compute_target_alignment_gate(target)
             
             # Compute cosine similarity: cos(v_actual, v_ref) = (v_actual · v_ref) / (||v_actual|| * ||v_ref||)
             v_actual_norm = np.linalg.norm(v_actual)
@@ -778,7 +1084,7 @@ class MultiTarEnv:
             epsilon = 1e-6
             if v_actual_norm > epsilon and v_ref_norm > epsilon:
                 cosine_similarity = np.dot(v_actual, v_ref) / (v_actual_norm * v_ref_norm)
-                alignment_reward = cosine_similarity
+                alignment_reward = alignment_gate * cosine_similarity
             else:
                 # If either velocity is zero, no alignment reward
                 alignment_reward = 0.0
@@ -849,11 +1155,21 @@ class MultiTarEnv:
                 agent_index = target_index_map[id(agent)] + self.num_hunters
             rewards[agent_index] += collision_penalty
 
+        captured_target_count = self._count_targets_in_state('captured')
+        escaped_target_count = self._count_targets_in_state('escaped')
+        outcome_code = self._get_outcome_code(timed_out=False)
+        outcome_hunter_bonus = 0.0
+        outcome_target_bonus = 0.0
+        if outcome_code is not None:
+            outcome_hunter_bonus, outcome_target_bonus = self._apply_outcome_bonus(rewards, outcome_code)
+
         reward_info = {
             'chase_rewards': chase_rewards,
             'capture_rewards': capture_rewards,
             'escape_rewards': escape_rewards,
             'alignment_rewards': alignment_rewards,
+            'gap_progress_rewards': gap_progress_rewards,
+            'stuck_penalties': stuck_penalties,
             'capture_happened': False,
             'captured_targets': captured_target_indices,
             'escape_happened': escape_happened,
@@ -864,6 +1180,14 @@ class MultiTarEnv:
             'max_group_size': max_group_size,
             'group_size_std': group_size_std,
             'interceptor_count': interceptor_count,
+            'blocked_chase_ratio': float(np.mean(blocked_chase_ratios)) if blocked_chase_ratios else 0.0,
+            'avg_gap_reward': float(np.mean(gap_progress_rewards)) if gap_progress_rewards else 0.0,
+            'avg_stuck_penalty': float(np.mean(stuck_penalties)) if stuck_penalties else 0.0,
+            'captured_target_count': captured_target_count,
+            'escaped_target_count': escaped_target_count,
+            'outcome_code': outcome_code,
+            'outcome_hunter_bonus': outcome_hunter_bonus,
+            'outcome_target_bonus': outcome_target_bonus,
         }
         all_targets_captured = all(
             self._get_target_state(target) == 'captured' for target in self.targets

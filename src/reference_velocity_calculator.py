@@ -1,41 +1,41 @@
 """
-参考速度计算器 (Reference Velocity Calculator)
-
-为target计算参考速度矢量，指导逃逸行为。
-参考速度由逃逸向量和避障向量组成，帮助target在hunter之间穿行并避开障碍物。
+Reference velocity calculation for target agents.
 """
 
-import numpy as np
 from typing import List, Optional
+
+import numpy as np
 
 
 class ReferenceVelocityCalculator:
     """
-    参考速度计算器，为target计算逃逸和避障的参考速度
-    
-    参考速度公式: v_ref = normalize(v1) + normalize(v2)
-    其中:
-        - v1: 逃逸向量，远离hunter的方向
-        - v2: 避障向量，基于激光雷达数据选择最安全的方向
+    Compute a locally feasible target guidance velocity from:
+    - hunter repulsion
+    - obstacle repulsion
+    - exit attraction
     """
-    
+
     def __init__(self, perception_range: float = 0.5):
-        """
-        初始化参考速度计算器
-        
-        参数:
-            perception_range: target的感知范围，只考虑此范围内的hunter
-        """
         self.perception_range = perception_range
 
     @staticmethod
     def _wrap_to_pi(angle: float) -> float:
         return (angle + np.pi) % (2 * np.pi) - np.pi
 
-    def _compute_feasible_exit_guidance(self, laser_data: np.ndarray,
-                                        laser_angles: np.ndarray,
-                                        exit_direction: np.ndarray,
-                                        max_range: float) -> tuple[np.ndarray, float]:
+    @staticmethod
+    def _safe_normalize(vector: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+        norm = float(np.linalg.norm(vector))
+        if norm <= eps:
+            return np.zeros(2, dtype=float)
+        return np.asarray(vector, dtype=float) / norm
+
+    def _compute_feasible_exit_guidance(
+        self,
+        laser_data: np.ndarray,
+        laser_angles: np.ndarray,
+        exit_direction: np.ndarray,
+        max_range: float,
+    ) -> tuple[np.ndarray, float]:
         """
         Project exit attraction onto a locally feasible ray and attenuate its weight
         when the direct path is obstructed.
@@ -50,7 +50,7 @@ class ReferenceVelocityCalculator:
         exit_unit = exit_direction / exit_norm
         exit_angle = float(np.arctan2(exit_unit[1], exit_unit[0]))
 
-        angle_diffs = np.array([self._wrap_to_pi(a - exit_angle) for a in laser_angles], dtype=float)
+        angle_diffs = np.array([self._wrap_to_pi(angle - exit_angle) for angle in laser_angles], dtype=float)
         direct_idx = int(np.argmin(np.abs(angle_diffs)))
         direct_clearance = float(np.clip(laser_data[direct_idx] / max_range, 0.0, 1.0))
 
@@ -60,63 +60,47 @@ class ReferenceVelocityCalculator:
             feasible_indices = np.where(feasible_mask)[0]
             best_idx = int(feasible_indices[np.argmin(np.abs(angle_diffs[feasible_indices]))])
             projected_angle = float(laser_angles[best_idx])
+            projected_clearance = float(np.clip(laser_data[best_idx] / max_range, 0.0, 1.0))
             angular_alignment = max(0.0, np.cos(self._wrap_to_pi(projected_angle - exit_angle)))
-            feasibility_gate = direct_clearance * (0.35 + 0.65 * angular_alignment)
+            # Nearby clear gaps should still produce a meaningful exit pull even when
+            # the direct ray is blocked, otherwise the target learns to stall in corners.
+            feasibility_gate = (
+                0.20 * direct_clearance
+                + 0.55 * projected_clearance
+                + 0.25 * angular_alignment
+            )
         else:
             best_idx = direct_idx
             projected_angle = float(laser_angles[best_idx])
-            feasibility_gate = direct_clearance ** 2
+            feasibility_gate = 0.35 * (direct_clearance ** 2)
 
         projected_vector = np.array([np.cos(projected_angle), np.sin(projected_angle)], dtype=float)
         return projected_vector, float(np.clip(feasibility_gate, 0.0, 1.0))
-    
-    def compute_escape_vector(self, target_pos: np.ndarray,
-                             hunter_positions: List[np.ndarray]) -> np.ndarray:
-        """
-        计算逃逸向量 v1
-        
-        v1 = -Σ(x_hunter_i - x_target) / ||Σ(x_hunter_i - x_target)||
-        
-        逃逸向量指向远离所有hunter质心的方向
-        
-        参数:
-            target_pos: 目标位置 [x, y, z]
-            hunter_positions: 感知范围内的hunter位置列表
-            
-        返回:
-            逃逸向量 [vx, vy]，如果没有hunter则返回零向量
-        """
+
+    def compute_escape_vector(self, target_pos: np.ndarray, hunter_positions: List[np.ndarray]) -> np.ndarray:
         if len(hunter_positions) == 0:
             return np.zeros(2)
-        
-        # 计算所有hunter到target的方向向量之和（2D）
-        direction_sum = np.zeros(2)
-        for hunter_pos in hunter_positions:
-            direction_sum += (hunter_pos[:2] - target_pos[:2])
-        
-        # 逃逸向量是反方向
-        escape_vector = -direction_sum
-        
-        return escape_vector
-    
-    def compute_avoidance_vector(self, laser_data: np.ndarray,
-                                laser_angles: np.ndarray,
-                                max_range: Optional[float] = None) -> np.ndarray:
-        """
-        计算避障向量 v2，基于激光雷达数据
 
-        将每条激光束的“缩短量”视为来自该方向的占据/危险强度：
-            shortened_i = max_range - distance_i
-        然后把这些缩短后的射线向量相加，取反得到斥力方向。
-        如果所有激光都未缩短，则返回零向量。
-        
-        参数:
-            laser_data: 激光雷达距离数据，形状 (num_lasers,)
-            laser_angles: 激光雷达角度数据，形状 (num_lasers,)
-            max_range: 激光最大量程，用于计算每条射线的缩短量
-            
-        返回:
-            避障向量 [vx, vy]
+        direction_sum = np.zeros(2, dtype=float)
+        for hunter_pos in hunter_positions:
+            delta = target_pos[:2] - hunter_pos[:2]
+            dist = float(np.linalg.norm(delta))
+            if dist <= 1e-6:
+                continue
+            # Boids-style separation: nearby hunters exert a much stronger repulsion.
+            direction_sum += delta / max(dist * dist, 1e-6)
+
+        return direction_sum
+
+    def compute_avoidance_vector(
+        self,
+        laser_data: np.ndarray,
+        laser_angles: np.ndarray,
+        max_range: Optional[float] = None,
+    ) -> np.ndarray:
+        """
+        Sum shortened laser beams as occupancy vectors and negate them to obtain
+        a repulsion direction. If no beams are shortened, return zero.
         """
         if len(laser_data) == 0:
             return np.zeros(2)
@@ -140,45 +124,97 @@ class ReferenceVelocityCalculator:
 
         return repulsion_vector / repulsion_norm
 
-    def compute_reference_velocity(self, target, hunters: List,
-                                    escape_zone_center: np.ndarray = None) -> np.ndarray:
+    def _project_direction_to_feasible_ray(
+        self,
+        laser_data: np.ndarray,
+        laser_angles: np.ndarray,
+        desired_direction: np.ndarray,
+        max_range: float,
+    ) -> tuple[np.ndarray, float]:
         """
-        计算参考速度 v_ref = normalize(v1) + normalize(v2) + w3 * normalize(v3)
-
-        v1: 逃逸向量（远离hunter）
-        v2: 避障向量（雷达最安全方向）
-        v3: 出口吸引力（朝逃逸区域）
-
-        参数:
-            target: Target对象
-            hunters: Hunter对象列表
-            escape_zone_center: 逃逸区域中心坐标 [x,y]，如果提供则加入出口吸引力
-
-        返回:
-            参考速度向量 [vx, vy]
+        Keep a steering direction smooth in open space, but project it toward a
+        nearby clear ray when the direct direction is blocked.
         """
-        # 找到感知范围内的hunters
+        desired_unit = self._safe_normalize(desired_direction)
+        if np.linalg.norm(desired_unit) <= 1e-9 or len(laser_data) == 0:
+            return desired_unit, 0.0
+
+        laser_data = np.asarray(laser_data, dtype=float)
+        laser_angles = np.asarray(laser_angles, dtype=float)
+        max_range = max(float(max_range), 1e-6)
+        desired_angle = float(np.arctan2(desired_unit[1], desired_unit[0]))
+        angle_diffs = np.array(
+            [self._wrap_to_pi(angle - desired_angle) for angle in laser_angles],
+            dtype=float,
+        )
+
+        direct_idx = int(np.argmin(np.abs(angle_diffs)))
+        direct_clearance = float(np.clip(laser_data[direct_idx] / max_range, 0.0, 1.0))
+        if direct_clearance >= 0.8:
+            return desired_unit, 1.0
+
+        feasible_mask = laser_data >= 0.6 * max_range
+        if np.any(feasible_mask):
+            feasible_indices = np.where(feasible_mask)[0]
+            best_idx = int(feasible_indices[np.argmin(np.abs(angle_diffs[feasible_indices]))])
+        else:
+            best_idx = int(np.argmax(laser_data))
+
+        projected_angle = float(laser_angles[best_idx])
+        projected_direction = np.array(
+            [np.cos(projected_angle), np.sin(projected_angle)],
+            dtype=float,
+        )
+        angular_alignment = max(
+            0.0,
+            np.cos(self._wrap_to_pi(projected_angle - desired_angle)),
+        )
+        projection_mix = float(np.clip(1.0 - direct_clearance, 0.0, 1.0))
+        corrected = self._safe_normalize(
+            (1.0 - projection_mix) * desired_unit + projection_mix * projected_direction
+        )
+        feasibility_gate = float(
+            np.clip(
+                direct_clearance * 0.4 + (1.0 - direct_clearance) * (0.3 + 0.7 * angular_alignment),
+                0.0,
+                1.0,
+            )
+        )
+        return corrected, feasibility_gate
+
+    def compute_reference_velocity(
+        self,
+        target,
+        hunters: List,
+        escape_zone_center: np.ndarray = None,
+    ) -> np.ndarray:
+        """
+        Boids-style steering with four components:
+        - separation from nearby hunters
+        - obstacle repulsion
+        - feasible exit attraction
+        - inertia from current velocity
+        """
         hunters_in_range = []
+        nearest_hunter_dist = self.perception_range
         for hunter in hunters:
             distance = np.linalg.norm(hunter.position[:2] - target.position[:2])
             if distance < self.perception_range:
                 hunters_in_range.append(hunter)
+                nearest_hunter_dist = min(nearest_hunter_dist, float(distance))
 
-        # 计算逃逸向量
         if len(hunters_in_range) > 0:
-            hunter_positions = [h.position for h in hunters_in_range]
+            hunter_positions = [hunter.position for hunter in hunters_in_range]
             v1 = self.compute_escape_vector(target.position, hunter_positions)
         else:
-            # 没有hunter在感知范围内，使用随机方向
-            angle = np.random.uniform(0, 2 * np.pi)
-            v1 = np.array([np.cos(angle), np.sin(angle)])
+            v1 = np.zeros(2)
 
-        # 计算避障向量
         v2 = self.compute_avoidance_vector(
-            target.lasers, target.lidar.angles, max_range=target.lidar.max_detect_d
+            target.lasers,
+            target.lidar.angles,
+            max_range=target.lidar.max_detect_d,
         )
 
-        # 计算出口吸引力（近距离大，远距离小），并对被障碍阻挡的方向做可行性门控
         v3 = np.zeros(2)
         w3 = 0.0
         if escape_zone_center is not None:
@@ -186,57 +222,68 @@ class ReferenceVelocityCalculator:
             escape_dist = np.linalg.norm(escape_dir)
             if escape_dist > 1e-6:
                 v3, exit_gate = self._compute_feasible_exit_guidance(
-                    target.lasers, target.lidar.angles, escape_dir, target.lidar.max_detect_d
+                    target.lasers,
+                    target.lidar.angles,
+                    escape_dir,
+                    target.lidar.max_detect_d,
                 )
-                # 对角线长度作为归一化参考
-                diag = np.sqrt(2) * 2.0  # 地图对角线约2.83
-                # 远距离权重低，近距离权重高
-                w3 = 0.5 * max(0.0, 1.0 - escape_dist / max(diag, 1e-6)) * exit_gate
+                diag = np.sqrt(2.0) * 2.0
+                progress_pressure = max(0.0, 1.0 - escape_dist / max(diag, 1e-6))
+                w3 = exit_gate * (0.55 + 0.55 * progress_pressure)
 
-        # 合成各分力（避障权重提高到1.5）
-        epsilon = 1e-6
-        v1_norm = np.linalg.norm(v1)
-        v2_norm = np.linalg.norm(v2)
+        current_velocity = np.asarray(target.velocity[:2], dtype=float)
+        v4 = self._safe_normalize(current_velocity)
 
-        v_ref = np.zeros(2)
-        if v1_norm > epsilon:
-            v_ref += v1 / v1_norm
-        if v2_norm > epsilon:
-            v_ref += 1.5 * (v2 / v2_norm)
-        if w3 > 0:
-            v_ref += w3 * v3
+        max_range = max(float(target.lidar.max_detect_d), 1e-6)
+        min_laser = float(np.min(target.lasers)) if len(target.lasers) > 0 else max_range
+        free_space_ratio = float(np.clip(np.mean(target.lasers) / max_range, 0.0, 1.0))
+        obstacle_pressure = float(np.clip(1.0 - min_laser / max_range, 0.0, 1.0))
+        hunter_pressure = 0.0
+        if len(hunters_in_range) > 0 and self.perception_range > 1e-6:
+            hunter_pressure = float(
+                np.clip(1.0 - nearest_hunter_dist / self.perception_range, 0.0, 1.0)
+            )
 
-        # 如果合力为零，保持当前速度方向
-        v_ref_norm = np.linalg.norm(v_ref)
-        if v_ref_norm < epsilon:
-            current_vel_norm = np.linalg.norm(target.velocity[:2])
-            if current_vel_norm > epsilon:
-                return target.velocity[:2] / current_vel_norm
-            else:
-                return np.array([1.0, 0.0])
+        w_sep = 0.5 + 2.0 * hunter_pressure
+        w_avoid = 0.85 + 1.85 * obstacle_pressure
+        w_goal = w3 * (0.65 + 0.55 * (1.0 - hunter_pressure)) * (0.35 + 0.65 * free_space_ratio)
+        w_inertia = 0.25 + 0.45 * (1.0 - obstacle_pressure)
 
-        return v_ref
-    
-    def is_inside_obstacle(self, position: np.ndarray,
-                          obstacles: List) -> bool:
-        """
-        检测位置是否在障碍物内部
-        
-        如果位置到某个障碍物中心的距离小于障碍物半径，则认为在障碍物内部
-        
-        参数:
-            position: 位置 [x, y, z]
-            obstacles: Obstacle对象列表
-            
-        返回:
-            True如果在障碍物内部，否则False
-        """
+        desired = np.zeros(2, dtype=float)
+        desired += w_sep * self._safe_normalize(v1)
+        desired += w_avoid * self._safe_normalize(v2)
+        desired += w_goal * self._safe_normalize(v3)
+        desired += w_inertia * v4
+
+        desired_dir = self._safe_normalize(desired)
+        if np.linalg.norm(desired_dir) <= 1e-9:
+            if np.linalg.norm(v4) > 1e-9:
+                return v4
+            if np.linalg.norm(v3) > 1e-9:
+                return self._safe_normalize(v3)
+            return np.array([1.0, 0.0], dtype=float)
+
+        feasible_dir, feasibility_gate = self._project_direction_to_feasible_ray(
+            target.lasers,
+            target.lidar.angles,
+            desired_dir,
+            max_range=max_range,
+        )
+
+        if np.linalg.norm(feasible_dir) <= 1e-9:
+            return desired_dir
+
+        if np.linalg.norm(v4) > 1e-9:
+            inertia_blend = 0.2 + 0.3 * feasibility_gate * (1.0 - obstacle_pressure)
+            feasible_dir = self._safe_normalize(
+                (1.0 - inertia_blend) * feasible_dir + inertia_blend * v4
+            )
+
+        return feasible_dir
+
+    def is_inside_obstacle(self, position: np.ndarray, obstacles: List) -> bool:
         for obstacle in obstacles:
-            # 计算到障碍物中心的距离（2D）
             distance = np.linalg.norm(position[:2] - obstacle.position[:2])
-            
-            # 检查是否在障碍物半径内
             if distance < obstacle.radius:
                 return True
-        
         return False
