@@ -84,6 +84,11 @@ class MultiTarEnv:
         self.hunter_time_penalty_coeff = 0.0
         self.blocked_chase_reward_coeff = 0.0
         self.stuck_penalty_coeff = 0.0
+        self.containment_progress_reward_coeff = 0.0
+        self.containment_quality_reward_coeff = 0.0
+        self.chaser_slot_reward_coeff = 0.0
+        self.chaser_side_balance_reward_coeff = 0.0
+        self.interceptor_quality_reward_coeff = 0.0
         self.full_capture_outcome_reward = 10.0
         self.partial_capture_outcome_reward = 3.0
         self.timeout_outcome_reward = -1.0
@@ -98,7 +103,7 @@ class MultiTarEnv:
         self.obstacle_interior_penalty = 0.3  # penalty for being inside obstacle (降低)
         self.obstacle_proximity_penalty_coeff = 0.6
         self.target_obstacle_warning_ratio = 0.35
-        self.obstacle_danger_ratio = 0.5
+        self.obstacle_danger_ratio = 0.35
         self.target_obs_include_hunters = True
         self.target_escape_sector_include_hunters = True
         self.target_hunter_repulsion_scale = 1.0
@@ -110,6 +115,9 @@ class MultiTarEnv:
         self.layout_clearance_margin = 0.08
         self.spawn_clearance_margin = 0.12
         self.exit_clearance_margin = 0.10
+        self.intercept_projection_clearance = 0.04
+        self.containment_slot_forward_offset = 0.06
+        self.containment_slot_lateral_offset = 0.09
 
         # Density field allocator for target assignment
         self.density_allocator = DensityFieldAllocator(
@@ -149,7 +157,9 @@ class MultiTarEnv:
         self.chase_progress_clip = 2.0 * self.v_max * self.time_step
         self._prev_hunter_positions = {}
         self._prev_target_positions = {}
+        self._prev_hunter_objectives = {}
         self._prev_target_ref_velocities = {}
+        self._prev_target_escape_bandwidths = {}
         self._target_boundary_clipped = {}
         self.target_states = {}
         self._reset_count = 0
@@ -178,6 +188,11 @@ class MultiTarEnv:
                 'hunter_time_penalty_coeff',
                 'blocked_chase_reward_coeff',
                 'stuck_penalty_coeff',
+                'containment_progress_reward_coeff',
+                'containment_quality_reward_coeff',
+                'chaser_slot_reward_coeff',
+                'chaser_side_balance_reward_coeff',
+                'interceptor_quality_reward_coeff',
                 'distance_threshold',
                 'full_capture_outcome_reward',
                 'partial_capture_outcome_reward',
@@ -218,12 +233,16 @@ class MultiTarEnv:
                 self.role_assigner.max_interceptor_distance = mechanism_config['max_interceptor_distance']
             if 'interceptor_prediction_steps' in mechanism_config:
                 self.role_assigner.prediction_steps = mechanism_config['interceptor_prediction_steps']
+            if 'interceptor_persistence_bonus' in mechanism_config:
+                self.role_assigner.interceptor_persistence_bonus = mechanism_config['interceptor_persistence_bonus']
             if 'map_refresh_interval' in mechanism_config:
                 self.map_refresh_interval = max(1, int(mechanism_config['map_refresh_interval']))
             if 'randomize_exit_zone' in mechanism_config:
                 self.randomize_exit_zone = bool(mechanism_config['randomize_exit_zone'])
             if 'randomize_layout' in mechanism_config:
                 self.randomize_layout = bool(mechanism_config['randomize_layout'])
+            if 'intercept_projection_clearance' in mechanism_config:
+                self.intercept_projection_clearance = float(mechanism_config['intercept_projection_clearance'])
             if 'target_obs_include_hunters' in mechanism_config:
                 self.target_obs_include_hunters = bool(mechanism_config['target_obs_include_hunters'])
             if 'target_escape_sector_include_hunters' in mechanism_config:
@@ -248,6 +267,98 @@ class MultiTarEnv:
             escape_urgency = max(0.0, 1.0 - dist_to_exit / max(diag, 1e-6))
             weights[id(target)] = 1.0 + self.assignment_escape_pressure_coeff * escape_urgency
         return weights
+
+    @staticmethod
+    def _safe_normalize(vector, eps=1e-6):
+        norm = float(np.linalg.norm(vector))
+        if norm <= eps:
+            return np.zeros(2, dtype=float)
+        return np.asarray(vector, dtype=float) / norm
+
+    def _get_escape_direction(self, target):
+        for candidate in (
+            getattr(target, 'reference_velocity', np.zeros(2, dtype=float)),
+            target.velocity[:2],
+            self.escape_zone_center - target.position[:2],
+        ):
+            direction = self._safe_normalize(candidate)
+            if np.linalg.norm(direction) > 1e-6:
+                return direction
+        return np.array([1.0, 0.0], dtype=float)
+
+    def _compute_target_escape_bandwidth(self, target, hunters):
+        hunter_positions = [tuple(h.position[:2]) for h in hunters]
+        histogram = utils.compute_histogram(
+            tuple(target.position[:2]),
+            hunter_positions,
+            self.L_sensor * 2,
+            max_range=self.L_sensor,
+            boundary_length=self.length,
+            obstacles=self.obstacles,
+        )
+        angles = np.arange(0, 2 * np.pi, np.pi / 16)
+        largest_escape_interval = utils.find_largest_clear_band(
+            histogram,
+            angles,
+            self.L_sensor,
+        )
+        if largest_escape_interval is None:
+            return 0.0
+
+        start_deg, end_deg = largest_escape_interval
+        start = self._wrap_angle(np.deg2rad(start_deg))
+        end = self._wrap_angle(np.deg2rad(end_deg))
+        width = (end - start) % (2 * np.pi)
+        if width < 1e-6:
+            width = 2 * np.pi
+        return float(np.clip(width / (2 * np.pi), 0.0, 1.0))
+
+    def _update_escape_bandwidth_cache(self):
+        target_hunter_groups = {}
+        for hunter in self.hunters:
+            if hunter.assigned_target is not None and self._is_target_active(hunter.assigned_target):
+                target_hunter_groups.setdefault(hunter.assigned_target, []).append(hunter)
+        self._prev_target_escape_bandwidths = {
+            id(target): self._compute_target_escape_bandwidth(
+                target,
+                target_hunter_groups.get(target, []),
+            )
+            for target in self._get_active_targets()
+        }
+
+    def _project_intercept_point(self, point_xy, target):
+        clearance = max(float(self.intercept_projection_clearance), 1e-3)
+        point = np.asarray(point_xy, dtype=float).copy()
+        point = np.clip(point, clearance, self.length - clearance)
+        preferred = self._safe_normalize(point - target.position[:2])
+        if np.linalg.norm(preferred) <= 1e-6:
+            preferred = self._safe_normalize(target.velocity[:2])
+        if np.linalg.norm(preferred) <= 1e-6:
+            preferred = np.array([1.0, 0.0], dtype=float)
+
+        for _ in range(8):
+            adjusted = False
+            point = np.clip(point, clearance, self.length - clearance)
+            for obstacle in self.obstacles:
+                delta = point - obstacle.position[:2]
+                min_clearance = obstacle.radius + clearance
+                distance = float(np.linalg.norm(delta))
+                if distance >= min_clearance:
+                    continue
+
+                adjusted = True
+                push_dir = self._safe_normalize(delta)
+                if np.linalg.norm(push_dir) <= 1e-6:
+                    push_dir = preferred
+                blended = self._safe_normalize(0.75 * push_dir + 0.25 * preferred)
+                if np.linalg.norm(blended) <= 1e-6:
+                    blended = preferred
+                point = obstacle.position[:2] + blended * min_clearance
+                break
+            if not adjusted:
+                break
+
+        return np.clip(point, clearance, self.length - clearance)
 
     @staticmethod
     def _wrap_to_pi(angle):
@@ -413,23 +524,27 @@ class MultiTarEnv:
 
     def _compute_hunter_chase_reward(self, hunter, target):
         """
-        Distance-progress chase reward gated by heading quality.
+        Role-aware objective progress reward gated by heading quality.
 
-        If previous positions are unavailable, fall back to current positions so the
-        progress term becomes zero instead of introducing undefined values.
+        Chasers optimize progress to the target's current position; interceptors optimize
+        progress to the projected interception point stored in hunter.target_position.
         """
         hunter_pos = hunter.position[:2]
-        target_pos = target.position[:2]
+        objective_pos = (
+            hunter.target_position[:2]
+            if hunter.assigned_target is not None
+            else target.position[:2]
+        )
         prev_hunter_pos = self._prev_hunter_positions.get(id(hunter), hunter_pos)
-        prev_target_pos = self._prev_target_positions.get(id(target), target_pos)
+        prev_objective_pos = self._prev_hunter_objectives.get(id(hunter), objective_pos)
 
-        d_prev = np.linalg.norm(prev_target_pos - prev_hunter_pos)
-        d_curr = np.linalg.norm(target_pos - hunter_pos)
+        d_prev = np.linalg.norm(prev_objective_pos - prev_hunter_pos)
+        d_curr = np.linalg.norm(objective_pos - hunter_pos)
         progress = np.clip(d_prev - d_curr, -self.chase_progress_clip, self.chase_progress_clip)
 
         hunter_dir = hunter.velocity[:2]
         hunter_dir_norm = np.linalg.norm(hunter_dir)
-        target_dir = target_pos - hunter_pos
+        target_dir = objective_pos - hunter_pos
         target_dir_norm = np.linalg.norm(target_dir)
         if hunter_dir_norm > 1e-6 and target_dir_norm > 1e-6:
             cosine_heading = float(np.dot(hunter_dir, target_dir) / (hunter_dir_norm * target_dir_norm))
@@ -448,7 +563,12 @@ class MultiTarEnv:
         if len(hunter.lasers) == 0:
             return 0.0, 0.0, 0.0
 
-        target_vector = target.position[:2] - hunter.position[:2]
+        objective_pos = (
+            hunter.target_position[:2]
+            if hunter.assigned_target is not None
+            else target.position[:2]
+        )
+        target_vector = objective_pos - hunter.position[:2]
         target_distance = np.linalg.norm(target_vector)
         if target_distance <= 1e-6:
             return 0.0, 0.0, 0.0
@@ -495,6 +615,62 @@ class MultiTarEnv:
         stuck_penalty = blocked_ratio * stalled_ratio * lack_of_progress
 
         return blocked_ratio, gap_reward, stuck_penalty
+
+    def _compute_chaser_slot_rewards(self, target, chasers):
+        if not chasers:
+            return {}, 0.0
+
+        target_pos = target.position[:2]
+        escape_dir = self._get_escape_direction(target)
+        flank_dir = np.array([-escape_dir[1], escape_dir[0]], dtype=float)
+        forward_offset = float(self.containment_slot_forward_offset)
+        lateral_offset = float(self.containment_slot_lateral_offset)
+        slot_sigma = max(lateral_offset, 1e-3)
+        slots = [
+            target_pos + forward_offset * escape_dir + lateral_offset * flank_dir,
+            target_pos + forward_offset * escape_dir - lateral_offset * flank_dir,
+        ]
+
+        slot_rewards = {}
+        signed_side_scores = []
+        for hunter in chasers:
+            hunter_pos = hunter.position[:2]
+            min_slot_distance = min(np.linalg.norm(slot - hunter_pos) for slot in slots)
+            slot_rewards[id(hunter)] = float(
+                np.exp(-(min_slot_distance ** 2) / max(2.0 * slot_sigma ** 2, 1e-6))
+            )
+
+            rel = hunter_pos - target_pos
+            lateral = float(np.dot(rel, flank_dir))
+            forward = float(np.dot(rel, escape_dir))
+            forward_gate = float(
+                np.exp(-((forward - forward_offset) ** 2) / max(2.0 * forward_offset ** 2, 1e-6))
+            )
+            if abs(lateral) > 1e-6:
+                signed_side_scores.append(np.sign(lateral) * forward_gate)
+
+        side_balance = 0.0
+        if len(signed_side_scores) >= 2:
+            side_balance = float(np.clip(1.0 - abs(np.mean(signed_side_scores)), 0.0, 1.0))
+
+        return slot_rewards, side_balance
+
+    def _compute_interceptor_quality_reward(self, hunter, target):
+        intercept_pos = hunter.target_position[:2]
+        target_pos = target.position[:2]
+        target_to_intercept = float(np.linalg.norm(intercept_pos - target_pos))
+        hunter_to_intercept = float(np.linalg.norm(intercept_pos - hunter.position[:2]))
+        if target_to_intercept <= 1e-6:
+            return 0.0
+
+        escape_dir = self._get_escape_direction(target)
+        forward_progress = float(np.dot(hunter.position[:2] - target_pos, escape_dir))
+        forward_gate = float(np.clip(0.5 + 0.5 * np.tanh(forward_progress / 0.06), 0.0, 1.0))
+        arrival_margin = (target_to_intercept - hunter_to_intercept) / max(
+            target_to_intercept + hunter_to_intercept,
+            1e-6,
+        )
+        return float(np.clip(arrival_margin, -1.0, 1.0) * forward_gate)
 
     def _compute_target_alignment_gate(self, target):
         wall_threshold = 0.6 * self.L_sensor
@@ -583,7 +759,11 @@ class MultiTarEnv:
         # Initialize Kalman filters for all targets
         for target in self.targets:
             target_id = id(target)
-            self.role_assigner.update_kalman_filter(target_id, target.position[:2])
+            self.role_assigner.update_kalman_filter(
+                target_id,
+                target.position[:2],
+                velocity=target.velocity[:2],
+            )
 
         # Assign initial targets to hunters
         self._assign_targets_to_hunters()
@@ -610,12 +790,16 @@ class MultiTarEnv:
         self._prev_target_positions = {
             id(target): target.position[:2].copy() for target in self.targets
         }
+        self._prev_hunter_objectives = {
+            id(hunter): hunter.target_position[:2].copy() for hunter in self.hunters
+        }
         self._prev_target_ref_velocities = {
             id(target): target.reference_velocity.copy() for target in self.targets
         }
         self._target_boundary_clipped = {
             id(target): False for target in self.targets
         }
+        self._update_escape_bandwidth_cache()
 
         # Get initial observations
         h_obs, t_obs = self._get_observations()
@@ -638,6 +822,9 @@ class MultiTarEnv:
         }
         self._prev_target_positions = {
             id(target): target.position[:2].copy() for target in self.targets
+        }
+        self._prev_hunter_objectives = {
+            id(hunter): hunter.target_position[:2].copy() for hunter in self.hunters
         }
         self._prev_target_ref_velocities = {
             id(target): target.reference_velocity.copy() for target in self.targets
@@ -717,7 +904,11 @@ class MultiTarEnv:
         for target in self.targets:
             if self._is_target_active(target):
                 target_id = id(target)
-                self.role_assigner.update_kalman_filter(target_id, target.position[:2])
+                self.role_assigner.update_kalman_filter(
+                    target_id,
+                    target.position[:2],
+                    velocity=target.velocity[:2],
+                )
         
         # Assign roles to hunters based on their assigned targets
         self._assign_hunter_roles()
@@ -766,6 +957,17 @@ class MultiTarEnv:
         """
         为hunter分配角色（chaser或interceptor）
         """
+        target_hunter_groups = {}
+        for hunter in self.hunters:
+            if hunter.assigned_target is not None:
+                target_hunter_groups.setdefault(hunter.assigned_target, []).append(hunter)
+
+        for hunter in self.hunters:
+            if hunter.assigned_target is None:
+                hunter.assigned_group_size = 0
+            else:
+                hunter.assigned_group_size = len(target_hunter_groups.get(hunter.assigned_target, []))
+
         if not self.use_role_assignment:
             # 消融模式：所有hunter均为chaser
             for hunter in self.hunters:
@@ -775,15 +977,6 @@ class MultiTarEnv:
                 else:
                     hunter.target_position = np.zeros(3)
             return
-
-        # 将hunters按照assigned_target分组
-        target_hunter_groups = {}
-        for hunter in self.hunters:
-            if hunter.assigned_target is not None:
-                target = hunter.assigned_target
-                if target not in target_hunter_groups:
-                    target_hunter_groups[target] = []
-                target_hunter_groups[target].append(hunter)
         
         # 为每组hunters分配角色
         for target, hunters in target_hunter_groups.items():
@@ -797,7 +990,10 @@ class MultiTarEnv:
                     hunter.role = roles[hunter_id]
                     # 根据角色设置target_position
                     hunter.target_position = self.role_assigner.get_target_position_for_hunter(
-                        hunter, target, hunter.role
+                        hunter,
+                        target,
+                        hunter.role,
+                        project_fn=self._project_intercept_point,
                     )
                 else:
                     # 默认为chaser
@@ -861,38 +1057,45 @@ class MultiTarEnv:
         for i, hunter in enumerate(self.hunters):
             if len(hunter_positions) >= 3:
                 nearest_indices = np.argpartition(hunter_pairwise[i], 2)[:2]
-                nearest_hunters = hunter_positions[nearest_indices]
+                nearest_hunters_xy = hunter_xy[nearest_indices]
             else:
-                other_hunters = np.delete(hunter_positions, i, axis=0)
+                other_hunters = np.delete(hunter_xy, i, axis=0)
                 # If less than two other hunters, pad with zeros
-                nearest_hunters = np.zeros((2, 3))
+                nearest_hunters_xy = np.zeros((2, 2), dtype=float)
                 if len(other_hunters) == 1:
-                    nearest_hunters[0] = other_hunters[0]
-                    nearest_hunters[1] = np.zeros(3)
+                    nearest_hunters_xy[0] = other_hunters[0]
                 else:
-                    nearest_hunters = np.zeros((2, 3))
+                    nearest_hunters_xy = np.zeros((2, 2), dtype=float)
 
             # Get velocity
-            velocity = hunter.velocity
+            velocity_xy = hunter.velocity[:2]
+            own_pos_xy = hunter.position[:2]
+            nearest_rel_xy = nearest_hunters_xy - own_pos_xy
 
-            # Get target position based on hunter's role
-            # target_position is already set by _assign_hunter_roles()
-            # For chaser: target.position
-            # For interceptor: predicted future position
-            target_pos = hunter.target_position
-            distance_to_target = np.linalg.norm(hunter.position[:2] - target_pos[:2])
+            if hunter.assigned_target is not None:
+                target_delta_xy = hunter.assigned_target.position[:2] - own_pos_xy
+                target_velocity_xy = hunter.assigned_target.velocity[:2]
+            else:
+                target_delta_xy = np.zeros(2, dtype=float)
+                target_velocity_xy = np.zeros(2, dtype=float)
+
+            pursuit_delta_xy = hunter.target_position[:2] - own_pos_xy
+            role_flag = 1.0 if hunter.role == 'interceptor' else 0.0
+            group_size_norm = hunter.assigned_group_size / max(self.num_hunters, 1)
 
             # Get laser data
             laser_data = hunter.lasers  # Assuming it's a 1D array of size num_lasers
 
             # Concatenate all observation components
             obs = np.concatenate([
-                nearest_hunters.flatten()/self.length,                   # 2 * 3 = 6
-                hunter.position/self.length,                             # 3
-                velocity/self.v_max,                                     # 3
-                target_pos/self.length,                                  # 3
-                np.array([distance_to_target])/(np.sqrt(2)*self.length), # 1
-                laser_data/self.L_sensor                                 # num_lasers
+                nearest_rel_xy.flatten() / self.length,                  # 2 * 2 = 4
+                own_pos_xy / self.length,                                # 2
+                velocity_xy / self.v_max,                                # 2
+                target_delta_xy / self.length,                           # 2
+                target_velocity_xy / self.v_max,                         # 2
+                pursuit_delta_xy / self.length,                          # 2
+                np.array([role_flag, group_size_norm], dtype=float),     # 2
+                laser_data / self.L_sensor                               # 16
             ]).astype(np.float32)
 
             h_obs.append(obs)
@@ -1024,7 +1227,10 @@ class MultiTarEnv:
         alignment_rewards = [0.0] * self.num_targets
         gap_progress_rewards = [0.0] * self.num_hunters
         stuck_penalties = [0.0] * self.num_hunters
+        containment_rewards = [0.0] * self.num_hunters
+        role_geometry_rewards = [0.0] * self.num_hunters
         blocked_chase_ratios = []
+        current_escape_bandwidths = {}
 
         # Pre-compute index mappings to avoid repeated .index() calls
         hunter_index_map = {id(h): i for i, h in enumerate(self.hunters)}
@@ -1071,6 +1277,20 @@ class MultiTarEnv:
 
         # Reward for hunters chasing and capturing targets
         for target, hunters in target_hunter_groups.items():
+            current_escape_bandwidth = self._compute_target_escape_bandwidth(target, hunters)
+            current_escape_bandwidths[id(target)] = current_escape_bandwidth
+            prev_escape_bandwidth = self._prev_target_escape_bandwidths.get(
+                id(target),
+                current_escape_bandwidth,
+            )
+            containment_progress = float(
+                np.clip(prev_escape_bandwidth - current_escape_bandwidth, -0.2, 0.2)
+            )
+            containment_quality = float(np.clip(1.0 - current_escape_bandwidth, 0.0, 1.0))
+            chasers = [hunter for hunter in hunters if hunter.role != 'interceptor']
+            slot_rewards, side_balance = self._compute_chaser_slot_rewards(target, chasers)
+            side_balance_share = side_balance / max(len(chasers), 1)
+
             # calculate chasing reward and ifrounded reward
             for hunter in hunters:
                 chase_reward, progress, _ = self._compute_hunter_chase_reward(hunter, target)
@@ -1085,6 +1305,27 @@ class MultiTarEnv:
                 rewards[hunter_index] -= self.stuck_penalty_coeff * stuck_penalty
                 stuck_penalties[hunter_index] += self.stuck_penalty_coeff * stuck_penalty
                 blocked_chase_ratios.append(blocked_ratio)
+
+                containment_share = 1.0 if hunter.role == 'chaser' else 0.6
+                containment_reward = (
+                    self.containment_progress_reward_coeff * containment_share * containment_progress
+                    + self.containment_quality_reward_coeff * containment_share * containment_quality
+                )
+                rewards[hunter_index] += containment_reward
+                containment_rewards[hunter_index] += containment_reward
+
+                if hunter.role == 'interceptor':
+                    role_reward = (
+                        self.interceptor_quality_reward_coeff
+                        * self._compute_interceptor_quality_reward(hunter, target)
+                    )
+                else:
+                    role_reward = (
+                        self.chaser_slot_reward_coeff * slot_rewards.get(id(hunter), 0.0)
+                        + self.chaser_side_balance_reward_coeff * side_balance_share
+                    )
+                rewards[hunter_index] += role_reward
+                role_geometry_rewards[hunter_index] += role_reward
 
             multi_hunters_pos = [h.position for h in hunters]
             if utils.isRounded(tuple(target.position[:2]), [tuple(row[:2]) for row in multi_hunters_pos], self.L_sensor, self.max_escape_angle,
@@ -1218,6 +1459,8 @@ class MultiTarEnv:
             'alignment_rewards': alignment_rewards,
             'gap_progress_rewards': gap_progress_rewards,
             'stuck_penalties': stuck_penalties,
+            'containment_rewards': containment_rewards,
+            'role_geometry_rewards': role_geometry_rewards,
             'capture_happened': False,
             'captured_targets': captured_target_indices,
             'escape_happened': escape_happened,
@@ -1231,6 +1474,9 @@ class MultiTarEnv:
             'blocked_chase_ratio': float(np.mean(blocked_chase_ratios)) if blocked_chase_ratios else 0.0,
             'avg_gap_reward': float(np.mean(gap_progress_rewards)) if gap_progress_rewards else 0.0,
             'avg_stuck_penalty': float(np.mean(stuck_penalties)) if stuck_penalties else 0.0,
+            'avg_containment_reward': float(np.mean(containment_rewards)) if containment_rewards else 0.0,
+            'avg_role_geometry_reward': float(np.mean(role_geometry_rewards)) if role_geometry_rewards else 0.0,
+            'avg_escape_bandwidth': float(np.mean(list(current_escape_bandwidths.values()))) if current_escape_bandwidths else 1.0,
             'captured_target_count': captured_target_count,
             'escaped_target_count': escaped_target_count,
             'outcome_code': outcome_code,
@@ -1247,6 +1493,7 @@ class MultiTarEnv:
         reward_info['capture_happened'] = capture_happened
         reward_info['all_targets_captured'] = all_targets_captured
         reward_info['episode_terminal'] = all_targets_captured or all_targets_resolved
+        self._prev_target_escape_bandwidths = current_escape_bandwidths
         if reward_info['episode_terminal'] and self.capture_ends_episode:
             dones = [True] * (self.num_hunters + self.num_targets)
         return rewards, dones, reward_info
@@ -1392,6 +1639,7 @@ class Hunter(AgentBase):
     def __init__(self, boundary_length, max_distance=0.2, num_rays=16, time_step=0.5, obstacles=None):
         super().__init__(boundary_length, max_distance, num_rays, time_step, obstacles)  # inherit base class
         self.assigned_target = None  # Target assigned by density field allocator
+        self.assigned_group_size = 0
         self.role = 'chaser'  # Role: 'chaser' or 'interceptor'
         self.target_position = np.zeros(3)  # Current target position to pursue (may be predicted position)
         '''

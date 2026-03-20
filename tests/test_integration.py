@@ -27,6 +27,7 @@ from density_field_allocator import DensityFieldAllocator, safe_divide
 from reference_velocity_calculator import ReferenceVelocityCalculator
 from role_assigner import RoleAssigner
 from kalman_filter import KalmanFilter
+from replaybuffer import ReplayBuffer
 
 
 class TestEnvironmentIntegration(unittest.TestCase):
@@ -488,6 +489,67 @@ class TestRoleAssignmentIntegration(unittest.TestCase):
         chaser_count = sum(1 for role in roles.values() if role == 'chaser')
         self.assertLessEqual(interceptor_count, 1)
         self.assertGreaterEqual(chaser_count, 2)
+
+    def test_update_kalman_filter_uses_velocity_signal(self):
+        """Velocity-aware updates should keep the filter's forward prediction moving."""
+        target_id = 123
+        measurement = np.array([0.0, 0.0], dtype=float)
+        velocity = np.array([0.1, 0.0], dtype=float)
+
+        self.assigner.update_kalman_filter(target_id, measurement, velocity=velocity)
+        for step in range(1, 5):
+            measurement = np.array([0.05 * step, 0.0], dtype=float)
+            self.assigner.update_kalman_filter(target_id, measurement, velocity=velocity)
+
+        kf = self.assigner.kalman_filters[target_id]
+        predicted = kf.predict_future(steps_ahead=3)
+
+        self.assertGreater(kf.get_velocity()[0], 0.02)
+        self.assertGreater(predicted[0], measurement[0])
+
+    def test_intercept_point_projection_avoids_obstacles(self):
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=1, num_hunters=3,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        obstacle = env.obstacles[0]
+        obstacle.position = np.array([1.0, 1.0, 0.0], dtype=float)
+        obstacle.radius = 0.15
+        target = env.targets[0]
+        target.position[:2] = np.array([0.8, 1.0], dtype=float)
+        target.velocity[:2] = np.array([0.05, 0.0], dtype=float)
+
+        projected = env._project_intercept_point(np.array([1.0, 1.0], dtype=float), target)
+
+        self.assertGreaterEqual(
+            np.linalg.norm(projected - obstacle.position[:2]),
+            obstacle.radius + env.intercept_projection_clearance - 1e-6,
+        )
+        self.assertTrue(np.all(projected >= env.intercept_projection_clearance - 1e-6))
+        self.assertTrue(np.all(projected <= env.length - env.intercept_projection_clearance + 1e-6))
+
+
+class TestReplayBufferIntegration(unittest.TestCase):
+    def test_rehearsal_buffer_retains_diverse_history(self):
+        np.random.seed(42)
+        buffer = ReplayBuffer(max_size=4, obs_dim=2, action_dim=1, rehearsal_size=6)
+
+        for i in range(20):
+            obs = np.array([i, i + 0.5], dtype=np.float32)
+            next_obs = np.array([i + 1, i + 1.5], dtype=np.float32)
+            buffer.store_transition(obs, np.array([0.0], dtype=np.float32), i, next_obs, False)
+
+        self.assertEqual(buffer.size(), 4)
+        self.assertEqual(len(buffer.rehearsal_buffer), 6)
+
+        latest_main_values = {16.0, 17.0, 18.0, 19.0}
+        rehearsal_values = {float(transition[0][0]) for transition in buffer.rehearsal_buffer}
+        self.assertTrue(any(value not in latest_main_values for value in rehearsal_values))
+
+        obs_batch, _, _, _, _ = buffer.sample(6, rehearsal_fraction=0.5)
+        self.assertEqual(obs_batch.shape[0], 6)
 
 
 class TestRewardIntegration(unittest.TestCase):

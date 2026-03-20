@@ -75,11 +75,16 @@ EXPERIMENT_CONFIGS = {
                     'name': 'pursuit_avoidance',
                     'until_fraction': 0.25,
                     'reward': {
-                        'capture_reward': 12.0,
+                        'capture_reward': 15.0,
                         'team_capture_bonus': 1.5,
-                        'chase_reward_coeff': 1.4,
+                        'chase_reward_coeff': 2.0,
                         'blocked_chase_reward_coeff': 0.0,
                         'stuck_penalty_coeff': 0.0,
+                        'containment_progress_reward_coeff': 0.0,
+                        'containment_quality_reward_coeff': 0.0,
+                        'chaser_slot_reward_coeff': 0.0,
+                        'chaser_side_balance_reward_coeff': 0.0,
+                        'interceptor_quality_reward_coeff': 0.0,
                         'escape_reward_coeff': 0.05,
                         'alignment_reward_coeff': 0.25,
                         'safe_penalty_coeff': 0.4,
@@ -118,17 +123,24 @@ EXPERIMENT_CONFIGS = {
                         'hunter_repeats': 5,
                         'target_repeats': 4,
                         'target_train_enabled': True,
+                        'hunter_rehearsal_fraction': 0.0,
+                        'target_rehearsal_fraction': 0.0,
                     },
                 },
                 {
                     'name': 'balanced_assignment',
                     'until_fraction': 0.55,
                     'reward': {
-                        'capture_reward': 11.0,
+                        'capture_reward': 15.0,
                         'team_capture_bonus': 2.5,
-                        'chase_reward_coeff': 1.3,
+                        'chase_reward_coeff': 1.6,
                         'blocked_chase_reward_coeff': 0.25,
                         'stuck_penalty_coeff': 0.05,
+                        'containment_progress_reward_coeff': 0.30,
+                        'containment_quality_reward_coeff': 0.10,
+                        'chaser_slot_reward_coeff': 0.20,
+                        'chaser_side_balance_reward_coeff': 0.10,
+                        'interceptor_quality_reward_coeff': 0.0,
                         'escape_reward_coeff': 0.10,
                         'alignment_reward_coeff': 0.35,
                         'safe_penalty_coeff': 0.4,
@@ -167,17 +179,24 @@ EXPERIMENT_CONFIGS = {
                         'hunter_repeats': 5,
                         'target_repeats': 3,
                         'target_train_enabled': True,
+                        'hunter_rehearsal_fraction': 0.15,
+                        'target_rehearsal_fraction': 0.10,
                     },
                 },
                 {
                     'name': 'escape_guidance',
                     'until_fraction': 0.80,
                     'reward': {
-                        'capture_reward': 14.0,
+                        'capture_reward': 20.0,
                         'team_capture_bonus': 3.0,
-                        'chase_reward_coeff': 1.05,
+                        'chase_reward_coeff': 1.3,
                         'blocked_chase_reward_coeff': 0.50,
                         'stuck_penalty_coeff': 0.10,
+                        'containment_progress_reward_coeff': 0.55,
+                        'containment_quality_reward_coeff': 0.20,
+                        'chaser_slot_reward_coeff': 0.35,
+                        'chaser_side_balance_reward_coeff': 0.18,
+                        'interceptor_quality_reward_coeff': 0.0,
                         'escape_reward_coeff': 0.10,
                         'alignment_reward_coeff': 0.45,
                         'safe_penalty_coeff': 0.35,
@@ -216,6 +235,8 @@ EXPERIMENT_CONFIGS = {
                         'hunter_repeats': 5,
                         'target_repeats': 4,
                         'target_train_enabled': True,
+                        'hunter_rehearsal_fraction': 0.25,
+                        'target_rehearsal_fraction': 0.10,
                     },
                 },
                 {
@@ -225,8 +246,13 @@ EXPERIMENT_CONFIGS = {
                         'capture_reward': 16.0,
                         'team_capture_bonus': 4.0,
                         'chase_reward_coeff': 1.10,
-                        'blocked_chase_reward_coeff': 0.75,
+                        'blocked_chase_reward_coeff': 0.55,
                         'stuck_penalty_coeff': 0.15,
+                        'containment_progress_reward_coeff': 0.80,
+                        'containment_quality_reward_coeff': 0.30,
+                        'chaser_slot_reward_coeff': 0.45,
+                        'chaser_side_balance_reward_coeff': 0.25,
+                        'interceptor_quality_reward_coeff': 1.20,
                         'escape_reward_coeff': 0.15,
                         'alignment_reward_coeff': 0.5,
                         'safe_penalty_coeff': 0.20,
@@ -258,6 +284,8 @@ EXPERIMENT_CONFIGS = {
                         'min_interceptor_distance': 0.14,
                         'max_interceptor_distance': 0.28,
                         'interceptor_prediction_steps': 3,
+                        'interceptor_persistence_bonus': 0.18,
+                        'intercept_projection_clearance': 0.05,
                         'map_refresh_interval': 8,
                         'randomize_exit_zone': True,
                         'target_obs_include_hunters': True,
@@ -270,6 +298,8 @@ EXPERIMENT_CONFIGS = {
                         'hunter_repeats': 4,
                         'target_repeats': 3,
                         'target_train_enabled': True,
+                        'hunter_rehearsal_fraction': 0.35,
+                        'target_rehearsal_fraction': 0.15,
                     },
                 },
             ],
@@ -405,18 +435,28 @@ def run_experiment(exp_name):
     max_steps = config.get('max_steps', 150)
     save_interval = config['save_interval']
 
-    hunters = [MATD3Agent(obs_dim=32, action_dim=2, lr=1e-3, gamma=0.95,
+    hunters = [MATD3Agent(obs_dim=env.h_actor_dim, action_dim=2, lr=1e-3, gamma=0.95,
                           tau=0.01, noise_std=0.005, device=device,
                           iforthogonalize=True, noise_clip=0.01, a_max=0.01)
                for _ in range(env.num_hunters)]
 
-    targets = [MATD3Agent(obs_dim=36, action_dim=2, lr=1e-3, gamma=0.95,
+    targets = [MATD3Agent(obs_dim=env.t_actor_dim, action_dim=2, lr=1e-3, gamma=0.95,
                           tau=0.01, noise_std=0.1, device=device,
                           iforthogonalize=True, noise_clip=0.01, a_max=0.01)
                for _ in range(env.num_targets)]
 
-    h_buffer = ReplayBuffer(max_size=10000, obs_dim=32, action_dim=2)
-    t_buffer = ReplayBuffer(max_size=10000, obs_dim=36, action_dim=2)
+    h_buffer = ReplayBuffer(
+        max_size=10000,
+        obs_dim=env.h_actor_dim,
+        action_dim=2,
+        rehearsal_size=2500 if curriculum else 0,
+    )
+    t_buffer = ReplayBuffer(
+        max_size=10000,
+        obs_dim=env.t_actor_dim,
+        action_dim=2,
+        rehearsal_size=1500 if curriculum else 0,
+    )
 
     # Checkpoint 续训支持
     checkpoint_path = os.path.join(exp_dir, 'checkpoint.pt')
@@ -440,9 +480,10 @@ def run_experiment(exp_name):
             w.writerow(["episode", "stage", "steps", "capture_success",
                          "outcome_code", "captured_target_count", "escaped_target_count",
                          "total_reward_hunters", "total_reward_targets",
-                         "avg_chase_reward", "avg_capture_reward",
-                         "avg_escape_reward", "avg_alignment_reward",
+                          "avg_chase_reward", "avg_capture_reward",
+                          "avg_escape_reward", "avg_alignment_reward",
                          "avg_gap_reward", "avg_stuck_penalty", "avg_blocked_chase",
+                         "avg_containment_reward", "avg_role_geometry_reward", "avg_escape_bandwidth",
                          "avg_critic_loss", "avg_actor_loss",
                          "avg_active_targets", "avg_min_group_size",
                          "avg_max_group_size", "avg_group_size_std",
@@ -477,7 +518,13 @@ def run_experiment(exp_name):
     for episode in tqdm(range(start_episode, num_episodes + 1), desc=f"[{exp_name}]",
                         initial=start_episode - 1, total=num_episodes, ncols=100):
         stage_name = 'default'
-        update_cfg = {'hunter_repeats': 5, 'target_repeats': 5, 'target_train_enabled': True}
+        update_cfg = {
+            'hunter_repeats': 5,
+            'target_repeats': 5,
+            'target_train_enabled': True,
+            'hunter_rehearsal_fraction': 0.0,
+            'target_rehearsal_fraction': 0.0,
+        }
         stage = resolve_curriculum_stage(curriculum, episode, num_episodes)
         if stage:
             env.configure_training_phase(
@@ -496,6 +543,7 @@ def run_experiment(exp_name):
         step = 0
         ep_chase, ep_capture, ep_escape, ep_align = [], [], [], []
         ep_gap, ep_stuck, ep_blocked = [], [], []
+        ep_containment, ep_role_geom, ep_escape_bandwidth = [], [], []
         ep_active_targets, ep_min_group, ep_max_group, ep_group_std, ep_interceptors = [], [], [], [], []
         ep_closs, ep_aloss = [], []
         capture = False
@@ -520,6 +568,9 @@ def run_experiment(exp_name):
             ep_gap.append(ri.get('avg_gap_reward', 0.0))
             ep_stuck.append(ri.get('avg_stuck_penalty', 0.0))
             ep_blocked.append(ri.get('blocked_chase_ratio', 0.0))
+            ep_containment.append(ri.get('avg_containment_reward', 0.0))
+            ep_role_geom.append(ri.get('avg_role_geometry_reward', 0.0))
+            ep_escape_bandwidth.append(ri.get('avg_escape_bandwidth', 1.0))
             ep_active_targets.append(ri.get('active_target_count', env.num_targets))
             ep_min_group.append(ri.get('min_group_size', 0))
             ep_max_group.append(ri.get('max_group_size', 0))
@@ -559,7 +610,10 @@ def run_experiment(exp_name):
             if update_counter % 10 == 0:
                 if h_buffer.size() >= 1024:
                     for _ in range(update_cfg.get('hunter_repeats', 5)):
-                        batch = h_buffer.sample(256)
+                        batch = h_buffer.sample(
+                            256,
+                            rehearsal_fraction=update_cfg.get('hunter_rehearsal_fraction', 0.0),
+                        )
                         for h in hunters:
                             losses = h.update(batch)
                             if losses:
@@ -568,7 +622,10 @@ def run_experiment(exp_name):
                                     ep_aloss.append(losses[1])
                 if update_cfg.get('target_train_enabled', True) and t_buffer.size() >= 1024:
                     for _ in range(update_cfg.get('target_repeats', 5)):
-                        batch = t_buffer.sample(256)
+                        batch = t_buffer.sample(
+                            256,
+                            rehearsal_fraction=update_cfg.get('target_rehearsal_fraction', 0.0),
+                        )
                         for t in targets:
                             t.update(batch)
 
@@ -592,6 +649,9 @@ def run_experiment(exp_name):
                          f"{np.mean(ep_gap):.4f}" if ep_gap else "0",
                          f"{np.mean(ep_stuck):.4f}" if ep_stuck else "0",
                          f"{np.mean(ep_blocked):.4f}" if ep_blocked else "0",
+                         f"{np.mean(ep_containment):.4f}" if ep_containment else "0",
+                         f"{np.mean(ep_role_geom):.4f}" if ep_role_geom else "0",
+                         f"{np.mean(ep_escape_bandwidth):.4f}" if ep_escape_bandwidth else "1",
                          f"{np.mean(ep_closs):.6f}" if ep_closs else "0",
                          f"{np.mean(ep_aloss):.6f}" if ep_aloss else "0",
                          f"{np.mean(ep_active_targets):.4f}" if ep_active_targets else "0",
