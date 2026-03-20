@@ -326,6 +326,37 @@ class TestEscapeStrategyIntegration(unittest.TestCase):
         np.testing.assert_allclose(v_ref_1, v_ref_2, atol=1e-9)
         self.assertLess(np.dot(v_ref_1, target.position[:2] - exit_center), 0.0)
 
+    def test_reference_velocity_can_ignore_hunters_with_zero_scale(self):
+        target = SimpleNamespace(
+            position=np.array([1.0, 1.0, 0.1], dtype=float),
+            velocity=np.zeros(3, dtype=float),
+            lasers=np.full(8, 0.20, dtype=float),
+            lidar=SimpleNamespace(
+                angles=np.linspace(0.0, 2 * np.pi, 8, endpoint=False),
+                max_detect_d=0.20,
+            ),
+        )
+        hunters = [
+            SimpleNamespace(position=np.array([0.8, 1.0, 0.1], dtype=float)),
+            SimpleNamespace(position=np.array([1.0, 0.8, 0.1], dtype=float)),
+        ]
+        exit_center = np.array([1.0, 1.8], dtype=float)
+
+        v_ref_with_hunters_disabled = self.calculator.compute_reference_velocity(
+            target,
+            hunters,
+            escape_zone_center=exit_center,
+            hunter_weight_scale=0.0,
+        )
+        v_ref_without_hunters = self.calculator.compute_reference_velocity(
+            target,
+            [],
+            escape_zone_center=exit_center,
+            hunter_weight_scale=0.0,
+        )
+
+        np.testing.assert_allclose(v_ref_with_hunters_disabled, v_ref_without_hunters, atol=1e-9)
+
     def test_reference_velocity_blends_inertia_and_exit_guidance(self):
         target = SimpleNamespace(
             position=np.array([1.0, 1.0, 0.1], dtype=float),
@@ -561,6 +592,46 @@ class TestRewardIntegration(unittest.TestCase):
         self.assertTrue(reward_info['all_targets_captured'])
         self.assertEqual(env._get_target_state(env.targets[1]), 'captured')
 
+    def test_partial_escape_does_not_end_multi_target_episode(self):
+        """One escaped target should not terminate the episode while another target remains active."""
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=1, num_hunters=4,
+            num_targets=2, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        env.targets[0].position[:2] = env.escape_zone_center.copy()
+        env.targets[1].position[:2] = np.array([1.7, 1.7], dtype=float)
+
+        with patch('utils.isRounded', return_value=False):
+            rewards, dones, reward_info = env._compute_rewards()
+
+        self.assertFalse(reward_info['episode_terminal'])
+        self.assertTrue(reward_info['escape_happened'])
+        self.assertEqual(env._get_target_state(env.targets[0]), 'escaped')
+        self.assertEqual(env._get_target_state(env.targets[1]), 'active')
+        self.assertTrue(dones[env.num_hunters])
+        self.assertFalse(dones[env.num_hunters + 1])
+
+    def test_episode_ends_only_after_all_targets_resolved_by_escape(self):
+        """Episode should terminate as failure only when the last remaining target also escapes."""
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=1, num_hunters=4,
+            num_targets=2, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        env._set_target_state(env.targets[0], 'escaped')
+        env.targets[1].position[:2] = env.escape_zone_center.copy()
+
+        with patch('utils.isRounded', return_value=False):
+            rewards, dones, reward_info = env._compute_rewards()
+
+        self.assertTrue(reward_info['episode_terminal'])
+        self.assertEqual(reward_info['outcome_code'], -1)
+        self.assertEqual(env._get_target_state(env.targets[1]), 'escaped')
+        self.assertTrue(all(dones))
+
     def test_chase_reward_uses_distance_progress_and_heading_gate(self):
         """Closing distance with good heading should yield positive chase reward."""
         env = MultiTarEnv(
@@ -632,6 +703,10 @@ class TestRewardIntegration(unittest.TestCase):
                 'max_interceptors_per_target': 0,
                 'map_refresh_interval': 7,
                 'randomize_exit_zone': True,
+                'target_obs_include_hunters': False,
+                'target_escape_sector_include_hunters': False,
+                'target_hunter_repulsion_scale': 0.25,
+                'target_ref_hunter_perception_range': 0.15,
             },
         )
 
@@ -646,9 +721,26 @@ class TestRewardIntegration(unittest.TestCase):
         self.assertEqual(env.role_assigner.max_interceptors_per_target, 0)
         self.assertEqual(env.map_refresh_interval, 7)
         self.assertTrue(env.randomize_exit_zone)
+        self.assertFalse(env.target_obs_include_hunters)
+        self.assertFalse(env.target_escape_sector_include_hunters)
+        self.assertEqual(env.target_hunter_repulsion_scale, 0.25)
+        self.assertEqual(env.ref_velocity_calculator.perception_range, 0.15)
         self.assertFalse(env.use_density_field)
         self.assertFalse(env.use_role_assignment)
         self.assertFalse(env.use_ref_velocity)
+
+    def test_target_observation_can_mask_hunter_positions(self):
+        env = MultiTarEnv(
+            length=2.0, num_obstacle=1, num_hunters=4,
+            num_targets=1, h_actor_dim=32, t_actor_dim=36,
+            action_dim=2, visualize_lasers=False
+        )
+        env.reset()
+        env.target_obs_include_hunters = False
+
+        _, t_obs = env._get_observations()
+        hunter_slice = t_obs[0][6:15]
+        np.testing.assert_allclose(hunter_slice, np.zeros(9), atol=1e-9)
 
     def test_blocked_chase_terms_reward_gap_following(self):
         """When direct pursuit is blocked, moving toward a nearby clear gap should be rewarded."""

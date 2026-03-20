@@ -97,6 +97,12 @@ class MultiTarEnv:
         self.alignment_reward_coeff = 0.5  # cosine similarity reward coefficient
         self.obstacle_interior_penalty = 0.3  # penalty for being inside obstacle (降低)
         self.obstacle_proximity_penalty_coeff = 0.6
+        self.target_obstacle_warning_ratio = 0.35
+        self.obstacle_danger_ratio = 0.5
+        self.target_obs_include_hunters = True
+        self.target_escape_sector_include_hunters = True
+        self.target_hunter_repulsion_scale = 1.0
+        self.target_hunter_contact_penalty_coeff = 1.0
         self.assignment_escape_pressure_coeff = 0.0
         self.randomize_layout = True
         self.randomize_exit_zone = False
@@ -165,6 +171,9 @@ class MultiTarEnv:
                 'alignment_reward_coeff',
                 'obstacle_interior_penalty',
                 'obstacle_proximity_penalty_coeff',
+                'target_obstacle_warning_ratio',
+                'obstacle_danger_ratio',
+                'target_hunter_contact_penalty_coeff',
                 'team_capture_bonus',
                 'hunter_time_penalty_coeff',
                 'blocked_chase_reward_coeff',
@@ -215,6 +224,14 @@ class MultiTarEnv:
                 self.randomize_exit_zone = bool(mechanism_config['randomize_exit_zone'])
             if 'randomize_layout' in mechanism_config:
                 self.randomize_layout = bool(mechanism_config['randomize_layout'])
+            if 'target_obs_include_hunters' in mechanism_config:
+                self.target_obs_include_hunters = bool(mechanism_config['target_obs_include_hunters'])
+            if 'target_escape_sector_include_hunters' in mechanism_config:
+                self.target_escape_sector_include_hunters = bool(mechanism_config['target_escape_sector_include_hunters'])
+            if 'target_hunter_repulsion_scale' in mechanism_config:
+                self.target_hunter_repulsion_scale = float(mechanism_config['target_hunter_repulsion_scale'])
+            if 'target_ref_hunter_perception_range' in mechanism_config:
+                self.ref_velocity_calculator.perception_range = float(mechanism_config['target_ref_hunter_perception_range'])
     
     def _collect_obs_info(self):
         multi_obs_info = []
@@ -332,6 +349,9 @@ class MultiTarEnv:
         all_targets_captured = all(
             self._get_target_state(target) == 'captured' for target in self.targets
         )
+        all_targets_resolved = all(
+            self._get_target_state(target) in ('captured', 'escaped') for target in self.targets
+        )
         any_target_escaped = any(
             self._get_target_state(target) == 'escaped' for target in self.targets
         )
@@ -339,9 +359,11 @@ class MultiTarEnv:
 
         if all_targets_captured:
             return 2
-        if any_target_escaped:
+        if all_targets_resolved and any_target_escaped:
             return -1
         if timed_out:
+            if any_target_escaped:
+                return -1
             return 1 if captured_target_count > 0 else 0
         return None
 
@@ -574,7 +596,10 @@ class MultiTarEnv:
                 target.reference_velocity = np.zeros(2)
             elif self.use_ref_velocity:
                 target.reference_velocity = self.ref_velocity_calculator.compute_reference_velocity(
-                    target, self.hunters, escape_zone_center=self.escape_zone_center
+                    target,
+                    self.hunters,
+                    escape_zone_center=self.escape_zone_center,
+                    hunter_weight_scale=self.target_hunter_repulsion_scale,
                 )
             else:
                 target.reference_velocity = np.zeros(2)
@@ -655,7 +680,11 @@ class MultiTarEnv:
             elif self.use_ref_velocity:
                 # 完整引导速度：逃逸向量 + 避障向量 + 出口吸引力
                 target.reference_velocity = self.ref_velocity_calculator.compute_reference_velocity(
-                    target, self.hunters, escape_zone_center=self.escape_zone_center)
+                    target,
+                    self.hunters,
+                    escape_zone_center=self.escape_zone_center,
+                    hunter_weight_scale=self.target_hunter_repulsion_scale,
+                )
             else:
                 # 简化引导速度：只有避障斥力 + 随机游走方向（不含逃逸hunter信息）
                 v_avoid = self.ref_velocity_calculator.compute_avoidance_vector(
@@ -670,6 +699,16 @@ class MultiTarEnv:
                 else:
                     v_ref = v_random
                 target.reference_velocity = v_ref
+
+        if not self.use_ref_velocity:
+            for target in self.targets:
+                if self._is_target_active(target):
+                    target.reference_velocity = self.ref_velocity_calculator.compute_reference_velocity(
+                        target,
+                        [],
+                        escape_zone_center=self.escape_zone_center,
+                        hunter_weight_scale=0.0,
+                    )
 
         # Assign targets to hunters using density field allocator
         self._assign_targets_to_hunters()
@@ -872,6 +911,8 @@ class MultiTarEnv:
                 # Pad with zeros if less than 3 hunters
                 pad_size = 3 - len(nearest_hunters)
                 nearest_hunters = np.vstack([nearest_hunters, np.zeros((pad_size, 3))])
+            if not self.target_obs_include_hunters:
+                nearest_hunters = np.zeros((3, 3), dtype=float)
 
             # Get laser data
             laser_data = target.lasers  # Assuming it's a 1D array of size num_lasers
@@ -922,7 +963,10 @@ class MultiTarEnv:
         if speed < 1e-6:
             return 0.0
 
-        hunter_positions = [tuple(h.position[:2]) for h in self.hunters]
+        if self.target_escape_sector_include_hunters:
+            hunter_positions = [tuple(h.position[:2]) for h in self.hunters]
+        else:
+            hunter_positions = []
         histogram = utils.compute_histogram(
             tuple(target.position[:2]),
             hunter_positions,
@@ -1092,7 +1136,7 @@ class MultiTarEnv:
             rewards[self.num_hunters + target_index] += self.alignment_reward_coeff * alignment_reward
             alignment_rewards[target_index] += self.alignment_reward_coeff * alignment_reward
 
-            obstacle_warning_threshold = 0.6 * self.L_sensor
+            obstacle_warning_threshold = self.target_obstacle_warning_ratio * self.L_sensor
             min_laser_length = float(np.min(target.lasers)) if len(target.lasers) > 0 else self.L_sensor
             if min_laser_length < obstacle_warning_threshold:
                 proximity_ratio = (obstacle_warning_threshold - min_laser_length) / max(obstacle_warning_threshold, 1e-6)
@@ -1126,7 +1170,11 @@ class MultiTarEnv:
             for target in self._get_active_targets():
                 distance = np.linalg.norm(hunter.position[:2] - target.position[:2])
                 if distance < self.distance_threshold:
-                    rewards[self.num_hunters + target_index_map[id(target)]] -= self.safe_penalty_coeff * (self.distance_threshold - distance)
+                    rewards[self.num_hunters + target_index_map[id(target)]] -= (
+                        self.target_hunter_contact_penalty_coeff
+                        * self.safe_penalty_coeff
+                        * (self.distance_threshold - distance)
+                    )
         
         # between targets
         active_targets = self._get_active_targets()
@@ -1140,7 +1188,7 @@ class MultiTarEnv:
 
         # reward for safety (uav-obstacles)
         # Only penalize when very close to obstacles (< 50% of sensor range)
-        obstacle_danger_threshold = self.L_sensor * 0.5
+        obstacle_danger_threshold = self.L_sensor * self.obstacle_danger_ratio
         for agent in self.hunters + self._get_active_targets():
             min_laser_length = min(agent.lasers)
             if min_laser_length < obstacle_danger_threshold:
@@ -1192,13 +1240,13 @@ class MultiTarEnv:
         all_targets_captured = all(
             self._get_target_state(target) == 'captured' for target in self.targets
         )
-        any_target_escaped = any(
-            self._get_target_state(target) == 'escaped' for target in self.targets
+        all_targets_resolved = all(
+            self._get_target_state(target) in ('captured', 'escaped') for target in self.targets
         )
         capture_happened = all_targets_captured
         reward_info['capture_happened'] = capture_happened
         reward_info['all_targets_captured'] = all_targets_captured
-        reward_info['episode_terminal'] = all_targets_captured or any_target_escaped
+        reward_info['episode_terminal'] = all_targets_captured or all_targets_resolved
         if reward_info['episode_terminal'] and self.capture_ends_episode:
             dones = [True] * (self.num_hunters + self.num_targets)
         return rewards, dones, reward_info

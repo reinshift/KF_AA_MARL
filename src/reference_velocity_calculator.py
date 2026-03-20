@@ -187,6 +187,7 @@ class ReferenceVelocityCalculator:
         target,
         hunters: List,
         escape_zone_center: np.ndarray = None,
+        hunter_weight_scale: float = 1.0,
     ) -> np.ndarray:
         """
         Boids-style steering with four components:
@@ -197,11 +198,12 @@ class ReferenceVelocityCalculator:
         """
         hunters_in_range = []
         nearest_hunter_dist = self.perception_range
-        for hunter in hunters:
-            distance = np.linalg.norm(hunter.position[:2] - target.position[:2])
-            if distance < self.perception_range:
-                hunters_in_range.append(hunter)
-                nearest_hunter_dist = min(nearest_hunter_dist, float(distance))
+        if hunter_weight_scale > 1e-6:
+            for hunter in hunters:
+                distance = np.linalg.norm(hunter.position[:2] - target.position[:2])
+                if distance < self.perception_range:
+                    hunters_in_range.append(hunter)
+                    nearest_hunter_dist = min(nearest_hunter_dist, float(distance))
 
         if len(hunters_in_range) > 0:
             hunter_positions = [hunter.position for hunter in hunters_in_range]
@@ -244,7 +246,7 @@ class ReferenceVelocityCalculator:
                 np.clip(1.0 - nearest_hunter_dist / self.perception_range, 0.0, 1.0)
             )
 
-        w_sep = 0.5 + 2.0 * hunter_pressure
+        w_sep = hunter_weight_scale * (0.5 + 2.0 * hunter_pressure)
         w_avoid = 0.85 + 1.85 * obstacle_pressure
         w_goal = w3 * (0.65 + 0.55 * (1.0 - hunter_pressure)) * (0.35 + 0.65 * free_space_ratio)
         w_inertia = 0.25 + 0.45 * (1.0 - obstacle_pressure)

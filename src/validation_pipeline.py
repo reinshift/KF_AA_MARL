@@ -20,6 +20,8 @@ import torch
 import cv2
 import matplotlib.pyplot as plt
 from matplotlib import rcParams
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from pathlib import Path
@@ -36,7 +38,18 @@ def setup_chinese_font():
     同时修复负号显示问题。
     """
     rcParams['font.sans-serif'] = ['SimSun', 'DejaVu Sans']  # 宋体，备用DejaVu Sans
+    rcParams['font.family'] = 'sans-serif'
     rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+
+
+def cn_font_kwargs(size: Optional[int] = None, weight: Optional[str] = None) -> Dict[str, Any]:
+    """Return explicit SimSun font kwargs for figure text elements."""
+    kwargs: Dict[str, Any] = {'fontname': 'SimSun'}
+    if size is not None:
+        kwargs['fontsize'] = size
+    if weight is not None:
+        kwargs['fontweight'] = weight
+    return kwargs
 
 
 class ValidationPipeline:
@@ -673,27 +686,42 @@ class ValidationPipeline:
         
         # 绘制hunters
         if hasattr(env, 'hunters'):
-            for hunter in env.hunters:
+            for idx, hunter in enumerate(env.hunters):
                 pos = hunter.position
-                ax.scatter(pos[0], pos[1], pos[2], c='red', marker='o', s=100, label='Hunter')
+                ax.scatter(
+                    pos[0], pos[1], pos[2],
+                    c='red', marker='o', s=100,
+                    label='追击者' if idx == 0 else None
+                )
         
         # 绘制targets
         if hasattr(env, 'targets'):
-            for target in env.targets:
+            for idx, target in enumerate(env.targets):
                 pos = target.position
-                ax.scatter(pos[0], pos[1], pos[2], c='green', marker='^', s=100, label='Target')
+                ax.scatter(
+                    pos[0], pos[1], pos[2],
+                    c='green', marker='^', s=100,
+                    label='逃逸者' if idx == 0 else None
+                )
         
         # 绘制obstacles
         if hasattr(env, 'obstacles'):
-            for obstacle in env.obstacles:
+            for idx, obstacle in enumerate(env.obstacles):
                 pos = obstacle.position
-                ax.scatter(pos[0], pos[1], pos[2], c='gray', marker='s', s=200, alpha=0.5, label='Obstacle')
+                ax.scatter(
+                    pos[0], pos[1], pos[2],
+                    c='gray', marker='s', s=200, alpha=0.5,
+                    label='障碍物' if idx == 0 else None
+                )
         
         # 设置坐标轴
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.set_title('环境状态')
+        ax.set_xlabel('X 轴', **cn_font_kwargs())
+        ax.set_ylabel('Y 轴', **cn_font_kwargs())
+        ax.set_zlabel('Z 轴', **cn_font_kwargs())
+        ax.set_title('环境状态', **cn_font_kwargs(size=14, weight='bold'))
+        legend = ax.legend(loc='upper right', prop={'family': 'SimSun', 'size': 11})
+        if legend is not None:
+            legend.set_title('图例', prop={'family': 'SimSun', 'size': 11})
         
         # 保存并关闭
         plt.savefig(filepath, dpi=100, bbox_inches='tight')
@@ -706,7 +734,9 @@ class ValidationPipeline:
             ax.set_xlim(-0.05, env.length + 0.05)
             ax.set_ylim(-0.05, env.length + 0.05)
             ax.set_aspect('equal')
-            ax.set_title(f'Episode {episode+1} | Step {step}', fontsize=14)
+            ax.set_title(f'第 {episode + 1} 回合 | 第 {step} 步', **cn_font_kwargs(size=14, weight='bold'))
+            ax.set_xlabel('X 轴', **cn_font_kwargs())
+            ax.set_ylabel('Y 轴', **cn_font_kwargs())
 
             # 边界
             ax.plot([0, env.length, env.length, 0, 0],
@@ -723,8 +753,14 @@ class ValidationPipeline:
                 esc = plt.Circle(env.escape_zone_center, env.escape_zone_radius,
                                  color='green', alpha=0.2, linestyle='--', linewidth=2, fill=True)
                 ax.add_patch(esc)
-                ax.annotate('EXIT', xy=env.escape_zone_center, ha='center', va='center',
-                            fontsize=10, color='green', fontweight='bold')
+                ax.annotate(
+                    '出口区',
+                    xy=env.escape_zone_center,
+                    ha='center',
+                    va='center',
+                    color='green',
+                    **cn_font_kwargs(size=10, weight='bold'),
+                )
 
             # 猎手
             h_colors = ['#e74c3c', '#c0392b', '#e67e22', '#d35400', '#f39c12', '#e84393']
@@ -746,6 +782,19 @@ class ValidationPipeline:
                     ax.plot(traj[:, 0], traj[:, 1], '-', color=c, alpha=0.3, lw=1)
                 ax.plot(target.position[0], target.position[1], '^', color=c,
                         markersize=10, markeredgecolor='black', markeredgewidth=0.5)
+
+            legend_handles = [
+                Line2D([0], [0], marker='o', color='w', label='追击者',
+                       markerfacecolor=h_colors[0], markeredgecolor='black', markersize=8),
+                Line2D([0], [0], marker='^', color='w', label='逃逸者',
+                       markerfacecolor=t_colors[0], markeredgecolor='black', markersize=9),
+                Patch(facecolor='gray', edgecolor='gray', alpha=0.5, label='障碍物'),
+                Patch(facecolor='green', edgecolor='green', alpha=0.2, label='出口区'),
+            ]
+            legend = ax.legend(handles=legend_handles, loc='upper right',
+                               prop={'family': 'SimSun', 'size': 10})
+            if legend is not None:
+                legend.set_title('图例', prop={'family': 'SimSun', 'size': 10})
 
             # 转为图像数组
             fig.canvas.draw()
