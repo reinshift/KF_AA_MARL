@@ -27,7 +27,8 @@ EXPERIMENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pape
 EXPERIMENT_CONFIGS = {
     'baseline': {
         'description': '旧奖励参数 baseline',
-        'num_episodes': 50,
+        'num_episodes': 250,
+        'max_steps': 250,
         'seed': 42,
         'reward': {
             'capture_reward': 2.0,
@@ -45,8 +46,9 @@ EXPERIMENT_CONFIGS = {
         'save_interval': 25,
     },
     'optimized': {
-        'description': '优化奖励参数（主实验）',
-        'num_episodes': 50,
+        'description': '优化奖励参数',
+        'num_episodes': 250,
+        'max_steps': 250,
         'seed': 42,
         'reward': {
             'capture_reward': 10.0,
@@ -65,9 +67,9 @@ EXPERIMENT_CONFIGS = {
     },
     'curriculum': {
         'description': 'curriculum training with balanced coverage and gated coordination',
-        'num_episodes': 200,
+        'num_episodes': 250,
         'seed': 42,
-        'max_steps': 200,
+        'max_steps': 250,
         'save_interval': 50,
         'curriculum': {
             'stages': [
@@ -331,7 +333,8 @@ EXPERIMENT_CONFIGS = {
     },
     'ablation_no_density': {
         'description': '消融：无密度场分配',
-        'num_episodes': 50,
+        'num_episodes': 250,
+        'max_steps': 250,
         'seed': 42,
         'reward': {
             'capture_reward': 10.0,
@@ -350,7 +353,8 @@ EXPERIMENT_CONFIGS = {
     },
     'ablation_no_role': {
         'description': '消融：无角色分配',
-        'num_episodes': 50,
+        'num_episodes': 250,
+        'max_steps': 250,
         'seed': 42,
         'reward': {
             'capture_reward': 10.0,
@@ -369,7 +373,8 @@ EXPERIMENT_CONFIGS = {
     },
     'ablation_no_refvel': {
         'description': '消融：无参考速度',
-        'num_episodes': 50,
+        'num_episodes': 250,
+        'max_steps': 250,
         'seed': 42,
         'reward': {
             'capture_reward': 10.0,
