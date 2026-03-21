@@ -1,0 +1,84 @@
+{
+  "model": {
+    "path": "paper_experiments/curriculum/models/ep_250"
+  },
+  "validation": {
+    "num_episodes": 20,
+    "max_steps": 250,
+    "save_frame_interval": 25
+  },
+  "output": {
+    "save_images": true,
+    "save_video": true,
+    "save_logs": true,
+    "video_fps": 10
+  },
+  "environment": {
+    "num_hunters": 6,
+    "num_targets": 2,
+    "num_obstacles": 5,
+    "env_length": 2.0
+  },
+  "random_seed": 42,
+  "device": "auto",
+  "headless": false,
+  "stage_name": "full_coordination",
+  "reward": {
+    "capture_reward": 16.0,
+    "team_capture_bonus": 4.0,
+    "chase_reward_coeff": 1.1,
+    "blocked_chase_reward_coeff": 0.55,
+    "stuck_penalty_coeff": 0.15,
+    "containment_progress_reward_coeff": 0.8,
+    "containment_quality_reward_coeff": 0.3,
+    "chaser_slot_reward_coeff": 0.45,
+    "chaser_side_balance_reward_coeff": 0.25,
+    "interceptor_quality_reward_coeff": 1.2,
+    "escape_reward_coeff": 0.15,
+    "alignment_reward_coeff": 0.5,
+    "safe_penalty_coeff": 0.2,
+    "obstacle_interior_penalty": 0.6,
+    "obstacle_proximity_penalty_coeff": 0.9,
+    "hunter_time_penalty_coeff": 0.005,
+    "full_capture_outcome_reward": 12.0,
+    "partial_capture_outcome_reward": 2.5,
+    "timeout_outcome_reward": -1.0,
+    "escape_outcome_reward": -6.0,
+    "target_full_capture_outcome_reward": -4.0,
+    "target_partial_capture_outcome_reward": -1.2,
+    "target_timeout_outcome_reward": -0.2,
+    "target_escape_outcome_reward": 6.0,
+    "distance_threshold": 0.012
+  },
+  "ablation": {
+    "use_density_field": true,
+    "use_role_assignment": true,
+    "use_ref_velocity": true
+  },
+  "mechanism": {
+    "assignment_escape_pressure_coeff": 0.7,
+    "density_underloaded_priority": 2.0,
+    "density_over_assignment_penalty": 1.5,
+    "assignment_density_value_weight": 1.0,
+    "assignment_target_proximity_weight": 3.2,
+    "assignment_slot_proximity_weight": 1.7,
+    "assignment_switch_penalty": 0.55,
+    "assignment_target_inertia_bonus": 0.4,
+    "assignment_slot_inertia_bonus": 0.24,
+    "min_group_size_for_interceptor": 3,
+    "max_interceptors_per_target": 1,
+    "min_target_speed_for_interceptor": 0.03,
+    "min_interceptor_distance": 0.14,
+    "max_interceptor_distance": 0.28,
+    "interceptor_prediction_steps": 3,
+    "interceptor_persistence_bonus": 0.18,
+    "intercept_projection_clearance": 0.05,
+    "map_refresh_interval": 8,
+    "randomize_exit_zone": true,
+    "target_obs_include_hunters": true,
+    "target_escape_sector_include_hunters": true,
+    "target_hunter_repulsion_scale": 1.0,
+    "target_hunter_contact_penalty_coeff": 1.0,
+    "target_ref_hunter_perception_range": 0.5
+  }
+}

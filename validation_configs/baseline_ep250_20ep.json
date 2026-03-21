@@ -1,0 +1,38 @@
+{
+  "model": {
+    "path": "paper_experiments/baseline/models/ep_250"
+  },
+  "validation": {
+    "num_episodes": 20,
+    "max_steps": 250,
+    "save_frame_interval": 25
+  },
+  "output": {
+    "save_images": true,
+    "save_video": true,
+    "save_logs": true,
+    "video_fps": 10
+  },
+  "environment": {
+    "num_hunters": 6,
+    "num_targets": 2,
+    "num_obstacles": 5,
+    "env_length": 2.0
+  },
+  "random_seed": 42,
+  "device": "auto",
+  "headless": false,
+  "reward": {
+    "capture_reward": 2.0,
+    "chase_reward_coeff": 0.8,
+    "escape_reward_coeff": 0.4,
+    "alignment_reward_coeff": 0.5,
+    "safe_penalty_coeff": 0.7,
+    "obstacle_interior_penalty": 1.0
+  },
+  "ablation": {
+    "use_density_field": true,
+    "use_role_assignment": true,
+    "use_ref_velocity": true
+  }
+}

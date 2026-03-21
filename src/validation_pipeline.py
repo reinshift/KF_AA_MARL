@@ -13,11 +13,14 @@
 """
 
 import os
+import sys
 import json
 import yaml
 import numpy as np
 import torch
 import cv2
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib import rcParams
 from matplotlib.lines import Line2D
@@ -209,6 +212,7 @@ class ValidationPipeline:
         config['validation'].setdefault('max_steps', 150)
         config['validation'].setdefault('save_frame_interval', 5)
         config.setdefault('random_seed', 42)
+        config.setdefault('device', 'auto')
         config['output'].setdefault('save_images', True)
         config['output'].setdefault('save_video', True)
         config['output'].setdefault('save_logs', True)
@@ -362,6 +366,12 @@ class ValidationPipeline:
         print(f"检测到模型维度: Hunter={h_actor_dim}, Target={t_actor_dim}")
         
         action_dim = 2
+        device_config = str(self.config.get('device', 'auto')).lower()
+        if device_config == 'auto':
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            device = torch.device(device_config)
+        print(f"Validation device: {device}")
         
         # 初始化环境
         self.env = MultiTarEnv(
@@ -374,6 +384,18 @@ class ValidationPipeline:
             action_dim=action_dim,
             visualize_lasers=False  # Don't visualize during validation
         )
+
+        reward_config = self.config.get('reward')
+        ablation_config = self.config.get('ablation')
+        mechanism_config = self.config.get('mechanism')
+        stage_name = self.config.get('stage_name')
+        if reward_config or ablation_config or mechanism_config or stage_name:
+            self.env.configure_training_phase(
+                stage_name=stage_name,
+                reward_config=reward_config,
+                ablation_config=ablation_config,
+                mechanism_config=mechanism_config,
+            )
         
         # 初始化hunter agents
         self.hunters = []
@@ -386,7 +408,7 @@ class ValidationPipeline:
                 tau=0.01,
                 noise_std=0.1,  # Standard noise for exploration
                 a_max=self.env.a_max,
-                device='cpu'
+                device=device
             )
             # 加载模型
             try:
@@ -408,7 +430,7 @@ class ValidationPipeline:
                 tau=0.01,
                 noise_std=0.1,  # Standard noise for exploration
                 a_max=self.env.a_max,
-                device='cpu'
+                device=device
             )
             # 加载模型
             try:
@@ -976,6 +998,10 @@ class ValidationPipeline:
 
 
 if __name__ == '__main__':
+    if len(sys.argv) >= 2:
+        pipeline = ValidationPipeline(sys.argv[1])
+        pipeline.run_validation()
+        raise SystemExit(0)
     # 示例用法
     print("ValidationPipeline 类已创建")
     print("使用示例:")
